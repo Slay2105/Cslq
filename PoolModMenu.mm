@@ -1,605 +1,424 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <QuartzCore/QuartzCore.h>
-#import <CoreGraphics/CoreGraphics.h>
 #import <mach/mach.h>
 #import <mach/vm_map.h>
+#import <mach-o/dyld.h>
+#import <dlfcn.h>
 #import <vector>
-#import <cmath>
+#import <algorithm>
 
-@interface PoolModOverlay : UIView <UITextFieldDelegate>
-// Layers vẽ đồ họa
-@property (nonatomic, strong) CAShapeLayer *tableLayer;
-@property (nonatomic, strong) CAShapeLayer *pocketsLayer;
-@property (nonatomic, strong) CAShapeLayer *aimLineLayer;
-@property (nonatomic, strong) CAShapeLayer *targetLineLayer;
-@property (nonatomic, strong) CAShapeLayer *tangentLineLayer;
-@property (nonatomic, strong) CAShapeLayer *bankLineLayer;
-@property (nonatomic, strong) CAShapeLayer *ghostBallLayer;
+#if __has_include("GeneratedOffsets.h")
+#import "GeneratedOffsets.h"
+#else
+static const uint64_t kAutoTrackOffsets[] = {};
+static const size_t kAutoTrackOffsetsCount = 0;
+#endif
 
-// Các nút kéo trên bàn
-@property (nonatomic, strong) UIView *cueBallHandle;
-@property (nonatomic, strong) UIView *objBallHandle;
-@property (nonatomic, strong) UIView *bankTargetHandle;
-@property (nonatomic, strong) UIView *tableTLHandle;
-@property (nonatomic, strong) UIView *tableBRHandle;
+struct TrackCandidate {
+    vm_address_t addr;
+    uint8_t onVal;
+};
 
-// Giao diện Menu & Icon nổi
-@property (nonatomic, strong) UIButton *floatingIcon;
-@property (nonatomic, strong) UIView *menuPanel;
-@property (nonatomic, strong) UILabel *angleInfoLabel;
-@property (nonatomic, strong) UILabel *memStatusLabel;
-@property (nonatomic, strong) UITextField *moneyInputField;
+@interface VP4NativeModView : UIView <UITextFieldDelegate>
+@property (nonatomic, strong) UIButton *floatingBtn;
+@property (nonatomic, strong) UIView *panelView;
+@property (nonatomic, strong) UILabel *statusLabel;
+@property (nonatomic, strong) UILabel *moneyStatusLabel;
+@property (nonatomic, strong) UITextField *moneyInput;
+@property (nonatomic, strong) CADisplayLink *freezeTimer;
 
-// Trạng thái tính năng
-@property (nonatomic, assign) BOOL aimEnabled;
-@property (nonatomic, assign) BOOL autoPocketEnabled;
-@property (nonatomic, assign) BOOL bankModeEnabled;
-@property (nonatomic, assign) BOOL tangentEnabled;
-@property (nonatomic, assign) BOOL calibrateTableMode;
-@property (nonatomic, assign) int selectedPocketIndex; // -1: Auto, 0..5: 6 lỗ
-@property (nonatomic, assign) CGFloat ballRadius;
+@property (nonatomic, assign) BOOL lockNativeTrack;
+@property (nonatomic, assign) BOOL lockPushOutAndRule;
 @end
 
-@implementation PoolModOverlay {
-    std::vector<vm_address_t> _scanResults;
+@implementation VP4NativeModView {
+    std::vector<TrackCandidate> _trackCandidates;
+    std::vector<TrackCandidate> _lockedTrackAddrs;
+    std::vector<vm_address_t> _moneyAddrs;
+    intptr_t _mainSlide;
+    vm_address_t _dataStart;
+    vm_size_t _dataSize;
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
         self.backgroundColor = [UIColor clearColor];
-        self.aimEnabled = YES;
-        self.autoPocketEnabled = YES;
-        self.bankModeEnabled = NO;
-        self.tangentEnabled = YES;
-        self.calibrateTableMode = NO;
-        self.selectedPocketIndex = -1;
-        self.ballRadius = 13.0;
+        self.lockNativeTrack = NO;
+        [self locateMainBinaryDataSegment];
+        [self setupUI];
 
-        [self setupDrawingLayers];
-        [self setupTableAndBallHandles];
-        [self setupFloatingIconAndMenu];
-        [self redrawAllTrajectories];
+        // Vòng lặp 60FPS giữ cờ Tia 3D Gốc của game luôn = BẬT
+        self.freezeTimer = [CADisplayLink displayLinkWithTarget:self selector:@selector(onFrameTick)];
+        [self.freezeTimer addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
     }
     return self;
 }
 
-// Cho phép chạm xuyên qua vùng trống để vuốt cơ bình thường trong game
+// Cho phép chạm xuyên qua vùng trống để xoay cơ, chỉnh áp-phê và kéo lực bình thường
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
-    if (hit == self) {
-        return nil;
-    }
+    if (hit == self) return nil;
     return hit;
 }
 
-#pragma mark - Khởi tạo Lớp Vẽ (CAShapeLayer)
+#pragma mark - Định vị vùng nhớ __DATA của VirtualPool4iPhone
 
-- (CAShapeLayer *)makeLayerWithColor:(UIColor *)color width:(CGFloat)width dashed:(BOOL)dashed {
-    CAShapeLayer *layer = [CAShapeLayer layer];
-    layer.strokeColor = color.CGColor;
-    layer.fillColor = [UIColor clearColor].CGColor;
-    layer.lineWidth = width;
-    if (dashed) {
-        layer.lineDashPattern = @[@6, @4];
-    }
-    [self.layer addSublayer:layer];
-    return layer;
-}
+- (void)locateMainBinaryDataSegment {
+    _mainSlide = 0;
+    _dataStart = 0;
+    _dataSize = 0;
 
-- (void)setupDrawingLayers {
-    self.tableLayer   = [self makeLayerWithColor:[UIColor colorWithRed:0.0 green:0.8 blue:1.0 alpha:0.4] width:1.2 dashed:YES];
-    self.pocketsLayer = [self makeLayerWithColor:[UIColor colorWithRed:1.0 green:0.3 blue:0.3 alpha:0.75] width:2.0 dashed:NO];
-    self.aimLineLayer = [self makeLayerWithColor:[UIColor whiteColor] width:1.6 dashed:NO];
-    self.targetLineLayer  = [self makeLayerWithColor:[UIColor colorWithRed:0.1 green:1.0 blue:0.3 alpha:0.95] width:2.0 dashed:NO];
-    self.tangentLineLayer = [self makeLayerWithColor:[UIColor colorWithRed:1.0 green:0.9 blue:0.0 alpha:0.75] width:1.3 dashed:YES];
-    self.bankLineLayer    = [self makeLayerWithColor:[UIColor colorWithRed:0.0 green:0.9 blue:1.0 alpha:0.9] width:1.6 dashed:YES];
-    self.ghostBallLayer   = [self makeLayerWithColor:[UIColor colorWithRed:0.0 green:1.0 blue:0.9 alpha:0.95] width:1.8 dashed:NO];
-}
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && (strstr(name, "VirtualPool") || i == 0)) {
+            _mainSlide = _dyld_get_image_vmaddr_slide(i);
+            const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(i);
+            const uint8_t *ptr = (const uint8_t *)(header + 1);
 
-#pragma mark - Nút Kéo Tâm Bi & Khung Bàn
-
-- (UIView *)createDraggablePointWithColor:(UIColor *)color size:(CGFloat)size center:(CGPoint)center title:(NSString *)title {
-    UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, size, size)];
-    v.center = center;
-    v.backgroundColor = [color colorWithAlphaComponent:0.20];
-    v.layer.cornerRadius = size / 2.0;
-    v.layer.borderColor = color.CGColor;
-    v.layer.borderWidth = 1.6;
-
-    // Tâm chấm nhỏ ở chính giữa để đặt chuẩn vào giữa viên bi
-    UIView *dot = [[UIView alloc] initWithFrame:CGRectMake((size - 4)/2.0, (size - 4)/2.0, 4, 4)];
-    dot.backgroundColor = color;
-    dot.layer.cornerRadius = 2.0;
-    dot.userInteractionEnabled = NO;
-    [v addSubview:dot];
-
-    if (title.length > 0) {
-        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(-10, -14, size + 20, 12)];
-        lbl.text = title;
-        lbl.font = [UIFont boldSystemFontOfSize:9];
-        lbl.textColor = color;
-        lbl.textAlignment = NSTextAlignmentCenter;
-        [v addSubview:lbl];
-    }
-
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onHandlePan:)];
-    [v addGestureRecognizer:pan];
-    [self addSubview:v];
-    return v;
-}
-
-- (void)setupTableAndBallHandles {
-    CGFloat W = self.bounds.size.width;
-    CGFloat H = self.bounds.size.height;
-    if (W < H) { CGFloat tmp = W; W = H; H = tmp; } // Ưu tiên màn ngang
-
-    // 2 Góc khung bàn (Trái-Trên & Phải-Dưới)
-    self.tableTLHandle = [self createDraggablePointWithColor:[UIColor cyanColor] size:26 center:CGPointMake(W * 0.14, H * 0.16) title:@"TL"];
-    self.tableBRHandle = [self createDraggablePointWithColor:[UIColor cyanColor] size:26 center:CGPointMake(W * 0.86, H * 0.82) title:@"BR"];
-    self.tableTLHandle.hidden = YES;
-    self.tableBRHandle.hidden = YES;
-
-    // Tâm Bi Cái (Trắng), Tâm Bi Mục Tiêu (Vàng), Điểm Đập Băng (Xanh)
-    self.cueBallHandle    = [self createDraggablePointWithColor:[UIColor whiteColor] size:34 center:CGPointMake(W * 0.32, H * 0.52) title:@"CÁI"];
-    self.objBallHandle    = [self createDraggablePointWithColor:[UIColor yellowColor] size:34 center:CGPointMake(W * 0.58, H * 0.45) title:@"MỤC TIÊU"];
-    self.bankTargetHandle = [self createDraggablePointWithColor:[UIColor cyanColor] size:30 center:CGPointMake(W * 0.50, H * 0.20) title:@"BĂNG"];
-    self.bankTargetHandle.hidden = YES;
-}
-
-- (void)onHandlePan:(UIPanGestureRecognizer *)pan {
-    CGPoint delta = [pan translationInView:self];
-    UIView *v = pan.view;
-    v.center = CGPointMake(v.center.x + delta.x, v.center.y + delta.y);
-    [pan setTranslation:CGPointZero inView:self];
-    [self redrawAllTrajectories];
-}
-
-#pragma mark - Thuật Toán Hình Học (Auto Ghost Ball, 6 Lỗ, Góc Tách 90, Phản Xạ Băng)
-
-- (CGRect)currentTableRect {
-    CGFloat minX = MIN(self.tableTLHandle.center.x, self.tableBRHandle.center.x);
-    CGFloat maxX = MAX(self.tableTLHandle.center.x, self.tableBRHandle.center.x);
-    CGFloat minY = MIN(self.tableTLHandle.center.y, self.tableBRHandle.center.y);
-    CGFloat maxY = MAX(self.tableTLHandle.center.y, self.tableBRHandle.center.y);
-    return CGRectMake(minX, minY, MAX(40, maxX - minX), MAX(40, maxY - minY));
-}
-
-- (void)getSixPockets:(CGPoint *)pockets fromRect:(CGRect)r {
-    pockets[0] = CGPointMake(CGRectGetMinX(r), CGRectGetMinY(r)); // Lỗ 1: Trái Trên
-    pockets[1] = CGPointMake(CGRectGetMidX(r), CGRectGetMinY(r)); // Lỗ 2: Giữa Trên
-    pockets[2] = CGPointMake(CGRectGetMaxX(r), CGRectGetMinY(r)); // Lỗ 3: Phải Trên
-    pockets[3] = CGPointMake(CGRectGetMinX(r), CGRectGetMaxY(r)); // Lỗ 4: Trái Dưới
-    pockets[4] = CGPointMake(CGRectGetMidX(r), CGRectGetMaxY(r)); // Lỗ 5: Giữa Dưới
-    pockets[5] = CGPointMake(CGRectGetMaxX(r), CGRectGetMaxY(r)); // Lỗ 6: Phải Dưới
-}
-
-- (void)redrawAllTrajectories {
-    if (!self.aimEnabled) return;
-
-    CGRect tableRect = [self currentTableRect];
-    CGPoint pockets[6];
-    [self getSixPockets:pockets fromRect:tableRect];
-
-    // 1. Vẽ khung bàn & 6 lỗ
-    UIBezierPath *tPath = [UIBezierPath bezierPathWithRect:tableRect];
-    self.tableLayer.path = tPath.CGPath;
-    self.tableLayer.hidden = !self.calibrateTableMode;
-
-    UIBezierPath *pPath = [UIBezierPath bezierPath];
-    for (int i = 0; i < 6; i++) {
-        [pPath appendPath:[UIBezierPath bezierPathWithOvalInRect:CGRectMake(pockets[i].x - 8, pockets[i].y - 8, 16, 16)]];
-    }
-    self.pocketsLayer.path = pPath.CGPath;
-
-    CGPoint P_cue = self.cueBallHandle.center;
-    CGPoint P_obj = self.objBallHandle.center;
-    CGFloat R = self.ballRadius;
-
-    // 2. Tìm lỗ tối ưu (Auto-Pocket) hoặc lỗ chỉ định
-    int bestPocket = self.selectedPocketIndex;
-    CGFloat bestCutDeg = 180.0;
-    CGPoint bestGhost = P_obj;
-
-    for (int i = 0; i < 6; i++) {
-        if (self.selectedPocketIndex != -1 && self.selectedPocketIndex != i) continue;
-
-        CGFloat dx = pockets[i].x - P_obj.x;
-        CGFloat dy = pockets[i].y - P_obj.y;
-        CGFloat len = hypot(dx, dy);
-        if (len < 1.0) continue;
-
-        CGFloat ux = dx / len;
-        CGFloat uy = dy / len;
-
-        // Tâm Ghost Ball chuẩn xác lùi 2R từ tâm Bi Mục Tiêu ngược hướng lỗ
-        CGPoint ghost = CGPointMake(P_obj.x - 2.0 * R * ux, P_obj.y - 2.0 * R * uy);
-
-        // Vector từ Bi Cái -> Ghost Ball
-        CGFloat sx = ghost.x - P_cue.x;
-        CGFloat sy = ghost.y - P_cue.y;
-        CGFloat sLen = hypot(sx, sy);
-        if (sLen < 1.0) continue;
-
-        // Góc chẻ bi (Cut Angle)
-        CGFloat dot = (sx / sLen) * ux + (sy / sLen) * uy;
-        dot = fmax(-1.0, fmin(1.0, dot));
-        CGFloat deg = acos(dot) * (180.0 / M_PI);
-
-        if (deg < bestCutDeg) {
-            bestCutDeg = deg;
-            bestPocket = i;
-            bestGhost = ghost;
+            for (uint32_t c = 0; c < header->ncmds; c++) {
+                const struct load_command *lc = (const struct load_command *)ptr;
+                if (lc->cmd == LC_SEGMENT_64) {
+                    const struct segment_command_64 *seg = (const struct segment_command_64 *)ptr;
+                    if (strcmp(seg->segname, "__DATA") == 0) {
+                        _dataStart = (vm_address_t)(seg->vmaddr + _mainSlide);
+                        _dataSize  = (vm_size_t)seg->vmsize;
+                        break;
+                    }
+                }
+                ptr += lc->cmdsize;
+            }
+            if (_dataStart != 0) break;
         }
     }
 
-    if (bestPocket < 0 || bestPocket > 5) bestPocket = 0;
-    CGPoint P_pocket = pockets[bestPocket];
-
-    // 3. Vẽ Tia Bi Cái -> Ghost Ball & Vòng tròn Ghost Ball
-    UIBezierPath *aimPath = [UIBezierPath bezierPath];
-    [aimPath moveToPoint:P_cue];
-    [aimPath addLineToPoint:bestGhost];
-    self.aimLineLayer.path = aimPath.CGPath;
-
-    // Đổi màu cảnh báo nếu góc chẻ > 78 độ (quá mỏng/bị che)
-    if (bestCutDeg <= 78.0) {
-        self.aimLineLayer.strokeColor = [UIColor whiteColor].CGColor;
-        self.targetLineLayer.strokeColor = [UIColor colorWithRed:0.1 green:1.0 blue:0.3 alpha:0.95].CGColor;
-    } else {
-        self.aimLineLayer.strokeColor = [UIColor redColor].CGColor;
-        self.targetLineLayer.strokeColor = [UIColor orangeColor].CGColor;
+    // Nạp sẵn các Offset tự động trích xuất từ GitHub Actions (nếu có)
+    for (size_t i = 0; i < kAutoTrackOffsetsCount; i++) {
+        vm_address_t target = (vm_address_t)(_mainSlide + kAutoTrackOffsets[i]);
+        _lockedTrackAddrs.push_back({target, 1});
     }
+}
 
-    UIBezierPath *ghostPath = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(bestGhost.x - R, bestGhost.y - R, R * 2.0, R * 2.0)];
-    self.ghostBallLayer.path = ghostPath.CGPath;
+#pragma mark - Vòng lặp Khóa Tia 3D Gốc (60Hz)
 
-    // 4. Vẽ Tia Ăn Bi (Bi Mục Tiêu -> Tâm Lỗ)
-    UIBezierPath *targetPath = [UIBezierPath bezierPath];
-    [targetPath moveToPoint:P_obj];
-    [targetPath addLineToPoint:P_pocket];
-    self.targetLineLayer.path = targetPath.CGPath;
+- (void)onFrameTick {
+    if (!self.lockNativeTrack) return;
 
-    // 5. Vẽ Tia Tách Bi Cái 90 độ sau va chạm (Tránh chết cái vào lỗ)
-    UIBezierPath *tanPath = [UIBezierPath bezierPath];
-    if (self.tangentEnabled) {
-        CGFloat ix = P_obj.x - bestGhost.x;
-        CGFloat iy = P_obj.y - bestGhost.y;
-        CGFloat iLen = hypot(ix, iy);
-        if (iLen > 0.1) {
-            ix /= iLen; iy /= iLen;
-            // Vector vuông góc với phương va chạm
-            CGFloat tx = -iy;
-            CGFloat ty = ix;
-            CGFloat sx = bestGhost.x - P_cue.x;
-            CGFloat sy = bestGhost.y - P_cue.y;
-            if (sx * tx + sy * ty < 0) { tx = -tx; ty = -ty; }
-            [tanPath moveToPoint:bestGhost];
-            [tanPath addLineToPoint:CGPointMake(bestGhost.x + tx * 220.0, bestGhost.y + ty * 220.0)];
-        }
+    mach_port_t task = mach_task_self();
+    for (const auto &item : _lockedTrackAddrs) {
+        uint8_t val = item.onVal ? item.onVal : 1;
+        vm_write(task, item.addr, (vm_offset_t)&val, sizeof(uint8_t));
     }
-    self.tangentLineLayer.path = tanPath.CGPath;
+}
 
-    // 6. Vẽ Tia Đập Băng Phản Xạ (2 Cushions) nếu bật chế độ Băng
-    UIBezierPath *bankPath = [UIBezierPath bezierPath];
-    if (self.bankModeEnabled) {
-        CGPoint curPos = P_cue;
-        CGFloat dx = self.bankTargetHandle.center.x - P_cue.x;
-        CGFloat dy = self.bankTargetHandle.center.y - P_cue.y;
-        CGFloat dLen = hypot(dx, dy);
-        if (dLen > 1.0) {
-            dx /= dLen; dy /= dLen;
-            [bankPath moveToPoint:curPos];
+#pragma mark - Quét & Tìm Cờ Tia 3D Gốc (Native 3D Trajectory Flag)
 
-            CGRect inner = CGRectInset(tableRect, R, R);
-            for (int bounce = 0; bounce < 3; bounce++) {
-                CGFloat tMin = 99999.0;
-                int hitWall = 0; // 1:Left/Right, 2:Top/Bottom
+// Bước 1: Quét khi đang ở màn chơi CÓ TIA 3D GỐC (như trong video: Practice hoặc Amateur)
+- (void)scanWhenTrackIsVisible {
+    _trackCandidates.clear();
+    mach_port_t task = mach_task_self();
 
-                if (fabs(dx) > 1e-4) {
-                    CGFloat tx1 = (CGRectGetMinX(inner) - curPos.x) / dx;
-                    CGFloat tx2 = (CGRectGetMaxX(inner) - curPos.x) / dx;
-                    if (tx1 > 1.0 && tx1 < tMin) { tMin = tx1; hitWall = 1; }
-                    if (tx2 > 1.0 && tx2 < tMin) { tMin = tx2; hitWall = 1; }
+    // Ưu tiên quét phân vùng __DATA của Binary chính (nơi lưu toàn bộ biến trạng thái C++ của Virtual Pool)
+    if (_dataStart != 0 && _dataSize != 0) {
+        std::vector<uint8_t> buf(_dataSize);
+        vm_size_t outSize = 0;
+        if (vm_read_overwrite(task, _dataStart, _dataSize, (vm_address_t)buf.data(), &outSize) == KERN_SUCCESS) {
+            for (vm_size_t i = 0; i < outSize; i++) {
+                uint8_t v = buf[i];
+                // Các cờ bật tia (bool = 1, hoặc mode = 1, 2, 3)
+                if (v >= 1 && v <= 3) {
+                    _trackCandidates.push_back({_dataStart + i, v});
                 }
-                if (fabs(dy) > 1e-4) {
-                    CGFloat ty1 = (CGRectGetMinY(inner) - curPos.y) / dy;
-                    CGFloat ty2 = (CGRectGetMaxY(inner) - curPos.y) / dy;
-                    if (ty1 > 1.0 && ty1 < tMin) { tMin = ty1; hitWall = 2; }
-                    if (ty2 > 1.0 && ty2 < tMin) { tMin = ty2; hitWall = 2; }
-                }
-                if (hitWall == 0 || tMin > 5000.0) break;
-
-                curPos = CGPointMake(curPos.x + dx * tMin, curPos.y + dy * tMin);
-                [bankPath addLineToPoint:curPos];
-                if (hitWall == 1) dx = -dx;
-                if (hitWall == 2) dy = -dy;
             }
         }
     }
-    self.bankLineLayer.path = bankPath.CGPath;
 
-    // Cập nhật thông số góc chẻ trên Menu
-    self.angleInfoLabel.text = [NSString stringWithFormat:@"Lỗ đích: #%d | Góc chẻ: %.1f° (%@)",
-                                bestPocket + 1, bestCutDeg, (bestCutDeg <= 78.0 ? @"KHẢ THI" : @"QUÁ MỎNG")];
+    // Quét thêm các vùng nhớ Heap nhỏ chứa cấu hình Match
+    vm_address_t addr = 0;
+    vm_size_t size = 0;
+    while (_trackCandidates.size() < 250000) {
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        if (vm_region_64(task, &addr, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &obj) != KERN_SUCCESS) break;
+
+        BOOL rw = (info.protection & VM_PROT_READ) && (info.protection & VM_PROT_WRITE);
+        if (rw && size <= 8 * 1024 * 1024 && addr != _dataStart) {
+            std::vector<uint8_t> buf(size);
+            vm_size_t outSize = 0;
+            if (vm_read_overwrite(task, addr, size, (vm_address_t)buf.data(), &outSize) == KERN_SUCCESS) {
+                for (vm_size_t i = 0; i < outSize; i += 4) {
+                    uint8_t v = buf[i];
+                    if (v == 1 && (i + 3 < outSize) && buf[i+1] == 0 && buf[i+2] == 0 && buf[i+3] == 0) {
+                        _trackCandidates.push_back({addr + i, 1});
+                        if (_trackCandidates.size() >= 250000) break;
+                    }
+                }
+            }
+        }
+        addr += size;
+    }
+
+    self.statusLabel.text = [NSString stringWithFormat:@"✅ Đã chụp %lu biến khi CÓ TIA.\nGiờ hãy tắt tia (hoặc vào trận mất tia) rồi bấm [2. Lọc Khi Mất Tia]!", (unsigned long)_trackCandidates.size()];
 }
 
-#pragma mark - Công Cụ Quét & Mod Tiền Trực Tiếp Trong RAM (Mach VM + NSUserDefaults)
+// Bước 2: Lọc khi vào chế độ MẤT TIA (giá trị chuyển về 0)
+- (void)filterWhenTrackIsHidden {
+    if (_trackCandidates.empty()) {
+        self.statusLabel.text = @"⚠️ Bạn cần bấm [1. Quét Khi Có Tia] trước!";
+        return;
+    }
 
-- (void)scanMemoryForValue:(int32_t)targetVal isFirstScan:(BOOL)firstScan {
-    if (firstScan) {
-        _scanResults.clear();
-        vm_address_t address = 0;
+    std::vector<TrackCandidate> nextList;
+    mach_port_t task = mach_task_self();
+
+    for (const auto &c : _trackCandidates) {
+        uint8_t cur = 255;
+        vm_size_t outSize = 0;
+        if (vm_read_overwrite(task, c.addr, sizeof(uint8_t), (vm_address_t)&cur, &outSize) == KERN_SUCCESS) {
+            if (cur == 0) {
+                nextList.push_back(c);
+            }
+        }
+    }
+
+    _trackCandidates = nextList;
+    self.statusLabel.text = [NSString stringWithFormat:@"🎯 Còn lại: %lu địa chỉ nghi vấn.\n(Nếu > 50, hãy bật lại tia rồi bấm [2B. Lọc Khi Có Lại] để chuẩn 100%%).", (unsigned long)_trackCandidates.size()];
+}
+
+// Bước 2B: Lọc lại một lần nữa khi BẬT LẠI TIA (giá trị quay về > 0) để chính xác tuyệt đối
+- (void)filterWhenTrackIsVisibleAgain {
+    if (_trackCandidates.empty()) return;
+
+    std::vector<TrackCandidate> nextList;
+    mach_port_t task = mach_task_self();
+
+    for (const auto &c : _trackCandidates) {
+        uint8_t cur = 0;
+        vm_size_t outSize = 0;
+        if (vm_read_overwrite(task, c.addr, sizeof(uint8_t), (vm_address_t)&cur, &outSize) == KERN_SUCCESS) {
+            if (cur == c.onVal || (cur >= 1 && cur <= 3)) {
+                nextList.push_back({c.addr, cur});
+            }
+        }
+    }
+
+    _trackCandidates = nextList;
+    self.statusLabel.text = [NSString stringWithFormat:@"🔥 Đã lọc chuẩn xác còn: %lu địa chỉ Tia 3D Gốc!\nBấm [3. KHÓA BẬT TIA 3D: ON] ngay!", (unsigned long)_trackCandidates.size()];
+}
+
+- (void)toggleLockNative3DTrack:(UIButton *)btn {
+    self.lockNativeTrack = !self.lockNativeTrack;
+    if (self.lockNativeTrack) {
+        if (!_trackCandidates.empty()) {
+            _lockedTrackAddrs.clear();
+            // Khóa tối đa 60 địa chỉ sát nhất để tránh ghi nhầm biến khác
+            size_t limit = std::min(_trackCandidates.size(), (size_t)60);
+            for (size_t i = 0; i < limit; i++) {
+                _lockedTrackAddrs.push_back(_trackCandidates[i]);
+            }
+        }
+        [btn setTitle:@"3. KHÓA BẬT TIA 3D GỐC: ĐANG BẬT (ON)" forState:UIControlStateNormal];
+        btn.backgroundColor = [UIColor colorWithRed:0.0 green:0.65 blue:0.35 alpha:0.95];
+
+        // Hiển thị luôn Offset thực tế để bạn có thể lưu cố định
+        if (!_lockedTrackAddrs.empty() && _mainSlide != 0) {
+            uint64_t firstOffset = (uint64_t)(_lockedTrackAddrs[0].addr - _mainSlide);
+            self.statusLabel.text = [NSString stringWithFormat:@"🔒 Đang ép bật %lu địa chỉ Tia 3D Gốc (Offset đầu: 0x%llX)",
+                                     (unsigned long)_lockedTrackAddrs.size(), firstOffset];
+        } else {
+            self.statusLabel.text = [NSString stringWithFormat:@"🔒 Đang khóa %lu địa chỉ Tia 3D Gốc!", (unsigned long)_lockedTrackAddrs.size()];
+        }
+    } else {
+        [btn setTitle:@"3. KHÓA BẬT TIA 3D GỐC: ĐANG TẮT (OFF)" forState:UIControlStateNormal];
+        btn.backgroundColor = [UIColor colorWithWhite:0.22 alpha:0.95];
+        self.statusLabel.text = @"Đã tạm dừng khóa Tia 3D Gốc.";
+    }
+}
+
+#pragma mark - Quét & Mod Tiền Career Mode
+
+- (void)scanMoney:(int32_t)val firstScan:(BOOL)first {
+    mach_port_t task = mach_task_self();
+    if (first) {
+        _moneyAddrs.clear();
+        vm_address_t addr = 0;
         vm_size_t size = 0;
-        mach_port_t task = mach_task_self();
-
         while (true) {
             vm_region_basic_info_data_64_t info;
             mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-            mach_port_t object_name = MACH_PORT_NULL;
+            mach_port_t obj = MACH_PORT_NULL;
+            if (vm_region_64(task, &addr, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &obj) != KERN_SUCCESS) break;
 
-            kern_return_t kr = vm_region_64(task, &address, &size, VM_REGION_BASIC_INFO_64,
-                                            (vm_region_info_t)&info, &count, &object_name);
-            if (kr != KERN_SUCCESS) break;
-
-            // Chỉ quét các vùng nhớ cho phép Đọc + Ghi (RW) và không bị khóa
-            BOOL isWritable = (info.protection & VM_PROT_WRITE) && (info.protection & VM_PROT_READ);
-            if (isWritable && size <= 64 * 1024 * 1024) {
-                const vm_size_t chunkLimit = 65536;
-                std::vector<uint8_t> buffer(chunkLimit);
-
-                for (vm_size_t offset = 0; offset < size; offset += chunkLimit) {
-                    vm_size_t readSize = MIN(chunkLimit, size - offset);
-                    vm_size_t outSize = 0;
-                    if (vm_read_overwrite(task, address + offset, readSize, (vm_address_t)buffer.data(), &outSize) == KERN_SUCCESS) {
-                        for (vm_size_t i = 0; i + sizeof(int32_t) <= outSize; i += 4) {
-                            int32_t val = *(int32_t *)(buffer.data() + i);
-                            if (val == targetVal) {
-                                _scanResults.push_back(address + offset + i);
-                                if (_scanResults.size() >= 150000) break;
+            if ((info.protection & VM_PROT_READ) && (info.protection & VM_PROT_WRITE) && size <= 64 * 1024 * 1024) {
+                const vm_size_t chunk = 65536;
+                std::vector<uint8_t> buf(chunk);
+                for (vm_size_t off = 0; off < size; off += chunk) {
+                    vm_size_t rSize = MIN(chunk, size - off);
+                    vm_size_t out = 0;
+                    if (vm_read_overwrite(task, addr + off, rSize, (vm_address_t)buf.data(), &out) == KERN_SUCCESS) {
+                        for (vm_size_t i = 0; i + 4 <= out; i += 4) {
+                            if (*(int32_t *)(buf.data() + i) == val) {
+                                _moneyAddrs.push_back(addr + off + i);
+                                if (_moneyAddrs.size() >= 150000) break;
                             }
                         }
                     }
-                    if (_scanResults.size() >= 150000) break;
+                    if (_moneyAddrs.size() >= 150000) break;
                 }
             }
-            address += size;
-            if (_scanResults.size() >= 150000) break;
+            addr += size;
+            if (_moneyAddrs.size() >= 150000) break;
         }
     } else {
-        std::vector<vm_address_t> filtered;
-        mach_port_t task = mach_task_self();
-        for (vm_address_t addr : _scanResults) {
-            int32_t currentVal = 0;
-            vm_size_t outSize = 0;
-            if (vm_read_overwrite(task, addr, sizeof(int32_t), (vm_address_t)&currentVal, &outSize) == KERN_SUCCESS) {
-                if (currentVal == targetVal) {
-                    filtered.push_back(addr);
-                }
+        std::vector<vm_address_t> next;
+        for (vm_address_t a : _moneyAddrs) {
+            int32_t cur = 0;
+            vm_size_t out = 0;
+            if (vm_read_overwrite(task, a, 4, (vm_address_t)&cur, &out) == KERN_SUCCESS && cur == val) {
+                next.push_back(a);
             }
         }
-        _scanResults = filtered;
+        _moneyAddrs = next;
     }
-
-    self.memStatusLabel.text = [NSString stringWithFormat:@"Tìm thấy: %lu địa chỉ khớp giá trị %d", (unsigned long)_scanResults.size(), targetVal];
+    self.moneyStatusLabel.text = [NSString stringWithFormat:@"Tìm thấy %lu địa chỉ khớp số tiền %d", (unsigned long)_moneyAddrs.size(), val];
 }
 
-- (void)writeNewMoneyValue:(int32_t)newVal {
+- (void)writeMoney:(int32_t)newVal {
     mach_port_t task = mach_task_self();
-    int modifiedCount = 0;
-    for (vm_address_t addr : _scanResults) {
-        if (vm_write(task, addr, (vm_offset_t)&newVal, sizeof(int32_t)) == KERN_SUCCESS) {
-            modifiedCount++;
-        }
+    int count = 0;
+    for (vm_address_t a : _moneyAddrs) {
+        if (vm_write(task, a, (vm_offset_t)&newVal, 4) == KERN_SUCCESS) count++;
     }
-
-    // Đồng thời kiểm tra & cập nhật các khóa tiền phổ biến trong NSUserDefaults nếu có
-    NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
-    NSDictionary *dict = [defs dictionaryRepresentation];
-    for (NSString *key in dict.allKeys) {
-        NSString *lower = [key lowercaseString];
-        if ([lower containsString:@"cash"] || [lower containsString:@"money"] ||
-            [lower containsString:@"coin"] || [lower containsString:@"bankroll"] ||
-            [lower containsString:@"funds"]) {
-            [defs setInteger:newVal forKey:key];
-        }
-    }
-    [defs synchronize];
-
-    self.memStatusLabel.text = [NSString stringWithFormat:@"Đã ghi %d vào %d địa chỉ RAM & Plist!", newVal, modifiedCount];
+    self.moneyStatusLabel.text = [NSString stringWithFormat:@"💰 Đã ghi 9,999,999$ vào %d địa chỉ!", count];
 }
 
-#pragma mark - Giao Diện Floating Icon & Bảng Menu Điều Khiển
+#pragma mark - Giao Diện Menu Điều Khiển
 
-- (void)setupFloatingIconAndMenu {
-    // 1. Nút Icon nổi (Kéo thả được)
-    self.floatingIcon = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.floatingIcon.frame = CGRectMake(25, 45, 48, 48);
-    self.floatingIcon.backgroundColor = [UIColor colorWithRed:0.08 green:0.12 blue:0.20 alpha:0.92];
-    self.floatingIcon.layer.cornerRadius = 24;
-    self.floatingIcon.layer.borderWidth = 2.0;
-    self.floatingIcon.layer.borderColor = [UIColor cyanColor].CGColor;
-    [self.floatingIcon setTitle:@"🎱" forState:UIControlStateNormal];
-    self.floatingIcon.titleLabel.font = [UIFont systemFontOfSize:24];
-    [self.floatingIcon addTarget:self action:@selector(toggleMenuPanel) forControlEvents:UIControlEventTouchUpInside];
+- (UIButton *)addBtn:(NSString *)title frame:(CGRect)frame tag:(NSInteger)tag action:(SEL)sel {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.frame = frame;
+    b.tag = tag;
+    b.backgroundColor = [UIColor colorWithWhite:0.20 alpha:0.95];
+    b.layer.cornerRadius = 7;
+    b.layer.borderWidth = 1.0;
+    b.layer.borderColor = [UIColor colorWithRed:0.0 green:0.8 blue:1.0 alpha:0.6].CGColor;
+    [b setTitle:title forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+    [b addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
+    [self.panelView addSubview:b];
+    return b;
+}
 
-    UIPanGestureRecognizer *iconPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onHandlePan:)];
-    [self.floatingIcon addGestureRecognizer:iconPan];
-    [self addSubview:self.floatingIcon];
+- (void)setupUI {
+    // Icon nổi 🎱
+    self.floatingBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.floatingBtn.frame = CGRectMake(25, 45, 46, 46);
+    self.floatingBtn.backgroundColor = [UIColor colorWithRed:0.06 green:0.10 blue:0.18 alpha:0.92];
+    self.floatingBtn.layer.cornerRadius = 23;
+    self.floatingBtn.layer.borderWidth = 2.0;
+    self.floatingBtn.layer.borderColor = [UIColor cyanColor].CGColor;
+    [self.floatingBtn setTitle:@"🎱" forState:UIControlStateNormal];
+    self.floatingBtn.titleLabel.font = [UIFont systemFontOfSize:22];
+    [self.floatingBtn addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
 
-    // 2. Bảng Menu chính
-    self.menuPanel = [[UIView alloc] initWithFrame:CGRectMake(85, 30, 320, 310)];
-    self.menuPanel.backgroundColor = [UIColor colorWithRed:0.06 green:0.08 blue:0.12 alpha:0.94];
-    self.menuPanel.layer.cornerRadius = 14;
-    self.menuPanel.layer.borderColor = [UIColor cyanColor].CGColor;
-    self.menuPanel.layer.borderWidth = 1.5;
-    self.menuPanel.hidden = YES;
-    [self addSubview:self.menuPanel];
+    UIPanGestureRecognizer *panIcon = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onDrag:)];
+    [self.floatingBtn addGestureRecognizer:panIcon];
+    [self addSubview:self.floatingBtn];
 
-    // Tiêu đề kéo thả được bảng Menu
-    UILabel *header = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 320, 34)];
-    header.backgroundColor = [UIColor colorWithRed:0.0 green:0.45 blue:0.65 alpha:0.4];
-    header.text = @"  VIRTUAL POOL 4 - PRO MOD MENU";
-    header.textColor = [UIColor cyanColor];
-    header.font = [UIFont boldSystemFontOfSize:13];
-    header.userInteractionEnabled = YES;
-    UIPanGestureRecognizer *menuPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onHandlePan:)];
-    [self.menuPanel addGestureRecognizer:menuPan];
-    [self.menuPanel addSubview:header];
+    // Bảng Menu chính
+    self.panelView = [[UIView alloc] initWithFrame:CGRectMake(80, 25, 330, 300)];
+    self.panelView.backgroundColor = [UIColor colorWithRed:0.05 green:0.07 blue:0.12 alpha:0.95];
+    self.panelView.layer.cornerRadius = 14;
+    self.panelView.layer.borderWidth = 1.5;
+    self.panelView.layer.borderColor = [UIColor cyanColor].CGColor;
+    self.panelView.hidden = YES;
+    [self addSubview:self.panelView];
 
-    // Thông số góc chẻ tự động
-    self.angleInfoLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 38, 296, 18)];
-    self.angleInfoLabel.textColor = [UIColor greenColor];
-    self.angleInfoLabel.font = [UIFont boldSystemFontOfSize:11];
-    [self.menuPanel addSubview:self.angleInfoLabel];
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 330, 32)];
+    title.backgroundColor = [UIColor colorWithRed:0.0 green:0.45 blue:0.70 alpha:0.35];
+    title.text = @"  VP4 - MỞ KHÓA TIA 3D GỐC (NATIVE TRACK)";
+    title.textColor = [UIColor cyanColor];
+    title.font = [UIFont boldSystemFontOfSize:12];
+    title.userInteractionEnabled = YES;
+    UIPanGestureRecognizer *panMenu = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onDrag:)];
+    [self.panelView addGestureRecognizer:panMenu];
+    [self.panelView addSubview:title];
 
-    // Hàng nút bật/tắt nhanh
-    [self createMenuButton:@"Line: BẬT" frame:CGRectMake(12, 60, 92, 30) tag:101 action:@selector(onFeatureBtn:)];
-    [self createMenuButton:@"Băng: TẮT" frame:CGRectMake(114, 60, 92, 30) tag:102 action:@selector(onFeatureBtn:)];
-    [self createMenuButton:@"Căn Bàn" frame:CGRectMake(216, 60, 92, 30) tag:103 action:@selector(onFeatureBtn:)];
+    // Nhóm 1: Mở khóa Tia 3D Gốc của Game
+    [self addBtn:@"1. Quét Khi CÓ TIA" frame:CGRectMake(10, 40, 100, 32) tag:1 action:@selector(onTrackBtn:)];
+    [self addBtn:@"2. Lọc Khi MẤT TIA" frame:CGRectMake(115, 40, 100, 32) tag:2 action:@selector(onTrackBtn:)];
+    [self addBtn:@"2B. Lọc CÓ LẠI" frame:CGRectMake(220, 40, 100, 32) tag:3 action:@selector(onTrackBtn:)];
 
-    // Chọn lỗ đích (Auto hoặc Lỗ 1..6)
-    UILabel *pLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 96, 80, 24)];
-    pLbl.text = @"Khóa Lỗ:";
-    pLbl.textColor = [UIColor whiteColor];
-    pLbl.font = [UIFont systemFontOfSize:11];
-    [self.menuPanel addSubview:pLbl];
+    [self addBtn:@"3. KHÓA BẬT TIA 3D GỐC: ĐANG TẮT (OFF)"
+           frame:CGRectMake(10, 78, 310, 34)
+             tag:4
+          action:@selector(toggleLockNative3DTrack:)];
 
-    NSArray *pTitles = @[@"AUTO", @"1", @"2", @"3", @"4", @"5", @"6"];
-    for (int i = 0; i < 7; i++) {
-        UIButton *b = [self createMenuButton:pTitles[i]
-                                       frame:CGRectMake(72 + i * 34, 96, 31, 24)
-                                         tag:200 + i
-                                      action:@selector(onPocketSelect:)];
-        if (i == 0) b.backgroundColor = [UIColor colorWithRed:0.0 green:0.6 blue:0.4 alpha:0.8];
-    }
+    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 116, 310, 48)];
+    self.statusLabel.text = @"HƯỚNG DẪN: Vào bàn đang hiện tia gốc (như video) -> bấm [1] -> Tắt tia hoặc vào Career mất tia -> bấm [2] -> Bật lại tia bấm [2B] -> Bấm [3] để khóa tia 3D gốc luôn hiện!";
+    self.statusLabel.textColor = [UIColor greenColor];
+    self.statusLabel.font = [UIFont systemFontOfSize:10];
+    self.statusLabel.numberOfLines = 3;
+    [self.panelView addSubview:self.statusLabel];
 
-    // Thanh trượt chỉnh kích thước vòng Ghost Ball khớp với độ zoom của bàn
-    UILabel *rLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 126, 95, 24)];
-    rLbl.text = @"Cỡ Bi (2R):";
-    rLbl.textColor = [UIColor whiteColor];
-    rLbl.font = [UIFont systemFontOfSize:11];
-    [self.menuPanel addSubview:rLbl];
+    // Nhóm 2: Mod Tiền
+    UIView *line = [[UIView alloc] initWithFrame:CGRectMake(10, 170, 310, 1)];
+    line.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.2];
+    [self.panelView addSubview:line];
 
-    UISlider *rSlider = [[UISlider alloc] initWithFrame:CGRectMake(95, 126, 210, 24)];
-    rSlider.minimumValue = 6.0;
-    rSlider.maximumValue = 28.0;
-    rSlider.value = 13.0;
-    [rSlider addTarget:self action:@selector(onRadiusChanged:) forControlEvents:UIControlEventValueChanged];
-    [self.menuPanel addSubview:rSlider];
-
-    // Khu vực Mod Tiền (RAM Scanner & Editor)
-    UIView *div = [[UIView alloc] initWithFrame:CGRectMake(12, 158, 296, 1)];
-    div.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.2];
-    [self.menuPanel addSubview:div];
-
-    UILabel *mTitle = [[UILabel alloc] initWithFrame:CGRectMake(12, 164, 296, 18)];
-    mTitle.text = @"💰 MOD TIỀN TRỰC TIẾP (NHẬP SỐ TIỀN HIỆN TẠI):";
+    UILabel *mTitle = [[UILabel alloc] initWithFrame:CGRectMake(10, 176, 310, 18)];
+    mTitle.text = @"💰 MOD TIỀN CAREER MODE (NHẬP TIỀN HIỆN TẠI):";
     mTitle.textColor = [UIColor yellowColor];
     mTitle.font = [UIFont boldSystemFontOfSize:11];
-    [self.menuPanel addSubview:mTitle];
+    [self.panelView addSubview:mTitle];
 
-    self.moneyInputField = [[UITextField alloc] initWithFrame:CGRectMake(12, 186, 135, 30)];
-    self.moneyInputField.backgroundColor = [UIColor colorWithWhite:0.18 alpha:1.0];
-    self.moneyInputField.textColor = [UIColor whiteColor];
-    self.moneyInputField.font = [UIFont boldSystemFontOfSize:13];
-    self.moneyInputField.placeholder = @"VD: 500";
-    self.moneyInputField.keyboardType = UIKeyboardTypeNumberPad;
-    self.moneyInputField.borderStyle = UITextBorderStyleRoundedRect;
-    self.moneyInputField.delegate = self;
-    [self.menuPanel addSubview:self.moneyInputField];
+    self.moneyInput = [[UITextField alloc] initWithFrame:CGRectMake(10, 198, 120, 30)];
+    self.moneyInput.backgroundColor = [UIColor colorWithWhite:0.15 alpha:1.0];
+    self.moneyInput.textColor = [UIColor whiteColor];
+    self.moneyInput.placeholder = @"Nhập số tiền...";
+    self.moneyInput.font = [UIFont boldSystemFontOfSize:12];
+    self.moneyInput.keyboardType = UIKeyboardTypeNumberPad;
+    self.moneyInput.borderStyle = UITextBorderStyleRoundedRect;
+    self.moneyInput.delegate = self;
+    [self.panelView addSubview:self.moneyInput];
 
-    [self createMenuButton:@"1. Quét Mới" frame:CGRectMake(155, 186, 74, 30) tag:301 action:@selector(onMoneyAction:)];
-    [self createMenuButton:@"2. Lọc Lại" frame:CGRectMake(235, 186, 73, 30) tag:302 action:@selector(onMoneyAction:)];
+    [self addBtn:@"Quét Tiền" frame:CGRectMake(138, 198, 86, 30) tag:10 action:@selector(onMoneyBtn:)];
+    [self addBtn:@"Lọc Tiền" frame:CGRectMake(232, 198, 88, 30) tag:11 action:@selector(onMoneyBtn:)];
+    [self addBtn:@"Sửa Tiền Thành 9,999,999$" frame:CGRectMake(10, 234, 310, 32) tag:12 action:@selector(onMoneyBtn:)];
 
-    [self createMenuButton:@"3. Sửa Tiền -> 9,999,999$"
-                     frame:CGRectMake(12, 224, 296, 32)
-                       tag:303
-                    action:@selector(onMoneyAction:)];
-
-    self.memStatusLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, 262, 296, 36)];
-    self.memStatusLabel.text = @"HD: Nhập tiền hiện có -> Bấm [1. Quét Mới] -> Đấu/Mua gì đó cho tiền đổi -> Nhập số mới -> [2. Lọc] -> [3. Sửa Tiền].";
-    self.memStatusLabel.textColor = [UIColor lightGrayColor];
-    self.memStatusLabel.font = [UIFont systemFontOfSize:10];
-    self.memStatusLabel.numberOfLines = 2;
-    [self.menuPanel addSubview:self.memStatusLabel];
+    self.moneyStatusLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 270, 310, 22)];
+    self.moneyStatusLabel.text = @"Sẵn sàng quét bộ nhớ.";
+    self.moneyStatusLabel.textColor = [UIColor lightGrayColor];
+    self.moneyStatusLabel.font = [UIFont systemFontOfSize:10];
+    [self.panelView addSubview:self.moneyStatusLabel];
 }
 
-- (UIButton *)createMenuButton:(NSString *)title frame:(CGRect)frame tag:(NSInteger)tag action:(SEL)action {
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
-    btn.frame = frame;
-    btn.tag = tag;
-    btn.backgroundColor = [UIColor colorWithWhite:0.20 alpha:0.9];
-    btn.layer.cornerRadius = 6;
-    btn.layer.borderColor = [UIColor colorWithWhite:0.45 alpha:1.0].CGColor;
-    btn.layer.borderWidth = 1.0;
-    [btn setTitle:title forState:UIControlStateNormal];
-    btn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
-    [btn addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
-    [self.menuPanel addSubview:btn];
-    return btn;
-}
-
-#pragma mark - Xử Lý Sự Kiện Nút Bấm
-
-- (void)toggleMenuPanel {
+- (void)togglePanel {
     [self endEditing:YES];
-    self.menuPanel.hidden = !self.menuPanel.hidden;
+    self.panelView.hidden = !self.panelView.hidden;
 }
 
-- (void)onFeatureBtn:(UIButton *)sender {
-    if (sender.tag == 101) {
-        self.aimEnabled = !self.aimEnabled;
-        [sender setTitle:(self.aimEnabled ? @"Line: BẬT" : @"Line: TẮT") forState:UIControlStateNormal];
-        self.aimLineLayer.hidden = !self.aimEnabled;
-        self.targetLineLayer.hidden = !self.aimEnabled;
-        self.tangentLineLayer.hidden = !self.aimEnabled;
-        self.ghostBallLayer.hidden = !self.aimEnabled;
-        self.pocketsLayer.hidden = !self.aimEnabled;
-        self.cueBallHandle.hidden = !self.aimEnabled;
-        self.objBallHandle.hidden = !self.aimEnabled;
-    } else if (sender.tag == 102) {
-        self.bankModeEnabled = !self.bankModeEnabled;
-        [sender setTitle:(self.bankModeEnabled ? @"Băng: BẬT" : @"Băng: TẮT") forState:UIControlStateNormal];
-        self.bankTargetHandle.hidden = !self.bankModeEnabled;
-        self.bankLineLayer.hidden = !self.bankModeEnabled;
-    } else if (sender.tag == 103) {
-        self.calibrateTableMode = !self.calibrateTableMode;
-        [sender setTitle:(self.calibrateTableMode ? @"Xong Bàn" : @"Căn Bàn") forState:UIControlStateNormal];
-        self.tableTLHandle.hidden = !self.calibrateTableMode;
-        self.tableBRHandle.hidden = !self.calibrateTableMode;
-        self.tableLayer.hidden = !self.calibrateTableMode;
-    }
-    [self redrawAllTrajectories];
+- (void)onDrag:(UIPanGestureRecognizer *)pan {
+    CGPoint d = [pan translationInView:self];
+    pan.view.center = CGPointMake(pan.view.center.x + d.x, pan.view.center.y + d.y);
+    [pan setTranslation:CGPointZero inView:self];
 }
 
-- (void)onPocketSelect:(UIButton *)sender {
-    for (int i = 0; i < 7; i++) {
-        UIButton *b = [self.menuPanel viewWithTag:200 + i];
-        b.backgroundColor = [UIColor colorWithWhite:0.20 alpha:0.9];
-    }
-    sender.backgroundColor = [UIColor colorWithRed:0.0 green:0.6 blue:0.4 alpha:0.85];
-    int idx = (int)sender.tag - 200;
-    self.selectedPocketIndex = (idx == 0) ? -1 : (idx - 1);
-    [self redrawAllTrajectories];
+- (void)onTrackBtn:(UIButton *)sender {
+    if (sender.tag == 1) [self scanWhenTrackIsVisible];
+    else if (sender.tag == 2) [self filterWhenTrackIsHidden];
+    else if (sender.tag == 3) [self filterWhenTrackIsVisibleAgain];
 }
 
-- (void)onRadiusChanged:(UISlider *)slider {
-    self.ballRadius = slider.value;
-    [self redrawAllTrajectories];
-}
-
-- (void)onMoneyAction:(UIButton *)sender {
+- (void)onMoneyBtn:(UIButton *)sender {
     [self endEditing:YES];
-    int32_t inputVal = (int32_t)[self.moneyInputField.text intValue];
-    if (sender.tag == 301) {
-        [self scanMemoryForValue:inputVal isFirstScan:YES];
-    } else if (sender.tag == 302) {
-        [self scanMemoryForValue:inputVal isFirstScan:NO];
-    } else if (sender.tag == 303) {
-        [self writeNewMoneyValue:9999999];
-    }
+    int32_t v = (int32_t)[self.moneyInput.text intValue];
+    if (sender.tag == 10) [self scanMoney:v firstScan:YES];
+    else if (sender.tag == 11) [self scanMoney:v firstScan:NO];
+    else if (sender.tag == 12) [self writeMoney:9999999];
 }
 
 - (BOOL)textFieldShouldReturn:(UITextField *)textField {
@@ -609,25 +428,20 @@
 
 @end
 
-#pragma mark - Constructor Tự Động Khởi Chạy Khi Mở Game
-
 __attribute__((constructor))
-static void initializeVirtualPoolMod() {
+static void initVP4NativeMod() {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        UIWindow *targetWindow = nil;
-        for (UIWindow *win in [UIApplication sharedApplication].windows) {
-            if (win.isKeyWindow) {
-                targetWindow = win;
-                break;
-            }
+        UIWindow *win = nil;
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w.isKeyWindow) { win = w; break; }
         }
-        if (!targetWindow && [UIApplication sharedApplication].windows.count > 0) {
-            targetWindow = [UIApplication sharedApplication].windows.firstObject;
+        if (!win && [UIApplication sharedApplication].windows.count > 0) {
+            win = [UIApplication sharedApplication].windows.firstObject;
         }
-        if (targetWindow) {
-            PoolModOverlay *overlay = [[PoolModOverlay alloc] initWithFrame:targetWindow.bounds];
-            overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-            [targetWindow addSubview:overlay];
+        if (win) {
+            VP4NativeModView *modView = [[VP4NativeModView alloc] initWithFrame:win.bounds];
+            modView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+            [win addSubview:modView];
         }
     });
 }
