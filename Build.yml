@@ -1,0 +1,36 @@
+name: Build VirtualPool Dylib
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-ios-dylib:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Compile PoolModMenu.dylib (arm64)
+        run: |
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          clang++ -arch arm64 \
+            -dynamiclib \
+            -isysroot "$SDK_PATH" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -O2 \
+            -framework UIKit \
+            -framework Foundation \
+            -framework QuartzCore \
+            -framework CoreGraphics \
+            PoolModMenu.mm \
+            -o PoolModMenu.dylib
+          ldid -S PoolModMenu.dylib || true
+
+      - name: Upload Compiled Dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: PoolModMenu-Dylib
+          path: PoolModMenu.dylib
