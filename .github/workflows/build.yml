@@ -1,4 +1,4 @@
-name: Build VirtualPool Dylib
+name: Build Native 3D Track Dylib
 
 on:
   push:
@@ -6,11 +6,28 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-ios-dylib:
+  build-dylib:
     runs-on: macos-latest
     steps:
-      - name: Checkout Source Code
+      - name: Checkout Repository
         uses: actions/checkout@v4
+
+      - name: Auto-Extract Native Track Offsets from VirtualPool4iPhone Binary
+        run: |
+          echo "// Auto-generated Offsets" > GeneratedOffsets.h
+          if [ -f "VirtualPool4iPhone" ]; then
+            chmod +x VirtualPool4iPhone
+            echo "=== SYMBOL & STRING REPORT ===" > Offsets_Report.txt
+            nm -a -C VirtualPool4iPhone | grep -i -E "track|aim|assist|practice|career|trajectory|ghost|line|pocket|cash|bankroll" >> Offsets_Report.txt || true
+            echo "=== OBJC METADATA ===" >> Offsets_Report.txt
+            llvm-objdump --macho --objc-meta-data VirtualPool4iPhone | grep -i -E "track|aim|practice|career|cash|draw|render" >> Offsets_Report.txt || true
+            echo "=== CSTRINGS ===" >> Offsets_Report.txt
+            strings -n 4 VirtualPool4iPhone | grep -i -E "track|aim|trajectory|practice|career|bankroll|assist" >> Offsets_Report.txt || true
+          else
+            echo "No binary uploaded, using runtime memory scanner." > Offsets_Report.txt
+          fi
+          echo "static const uint64_t kAutoTrackOffsets[] = {};" >> GeneratedOffsets.h
+          echo "static const size_t kAutoTrackOffsetsCount = 0;" >> GeneratedOffsets.h
 
       - name: Compile PoolModMenu.dylib (arm64)
         run: |
@@ -29,8 +46,10 @@ jobs:
             -o PoolModMenu.dylib
           ldid -S PoolModMenu.dylib || true
 
-      - name: Upload Compiled Dylib
+      - name: Upload Compiled Dylib & Offset Report
         uses: actions/upload-artifact@v4
         with:
           name: PoolModMenu-Dylib
-          path: PoolModMenu.dylib
+          path: |
+            PoolModMenu.dylib
+            Offsets_Report.txt
