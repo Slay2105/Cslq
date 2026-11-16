@@ -1,27 +1,36 @@
-name: Build iOS Dylib
+name: Build VirtualPool Dylib
 
 on:
   push:
+    branches: [ "main", "master" ]
   workflow_dispatch:
 
 jobs:
-  build:
+  build-ios-dylib:
     runs-on: macos-latest
     steps:
-      - name: Checkout code
+      - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      - name: Compile arm64 Dylib
+      - name: Compile PoolModMenu.dylib (arm64)
         run: |
-          xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
-            -fobjc-arc -Wno-deprecated-declarations \
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          clang++ -arch arm64 \
+            -dynamiclib \
+            -isysroot "$SDK_PATH" \
             -miphoneos-version-min=14.0 \
-            -framework UIKit -framework Foundation -framework WebKit -framework CoreGraphics -framework QuartzCore \
-            -install_name @rpath/AOVAutoClick.dylib \
-            Tweak.m -o AOVAutoClick.dylib
+            -fobjc-arc \
+            -O2 \
+            -framework UIKit \
+            -framework Foundation \
+            -framework QuartzCore \
+            -framework CoreGraphics \
+            PoolModMenu.mm \
+            -o PoolModMenu.dylib
+          ldid -S PoolModMenu.dylib || true
 
-      - name: Upload Dylib Artifact
+      - name: Upload Compiled Dylib
         uses: actions/upload-artifact@v4
         with:
-          name: AOVAutoClick-dylib
-          path: AOVAutoClick.dylib
+          name: PoolModMenu-Dylib
+          path: PoolModMenu.dylib
