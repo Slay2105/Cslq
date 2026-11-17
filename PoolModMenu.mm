@@ -7,25 +7,17 @@
 #import <mach-o/dyld.h>
 #import <objc/runtime.h>
 #import <vector>
-#import <algorithm>
 #import <cmath>
 
-// Hàm tính địa chỉ thực tế trong RAM từ địa chỉ tĩnh trong Offsets_Report_4.txt
 static inline vm_address_t VP4Addr(uintptr_t baseHeader, uint64_t staticVMA) {
     return (vm_address_t)(baseHeader + (staticVMA - 0x100000000ULL));
 }
 
-// Kiểu hàm gốc SetAimAids(int mode) tại 0x1001112b8 (0: No AimAids, 1: AimLine, 3: TrackAll)
-typedef void (*VP4SetAimAidsFn)(int mode);
+// 3 hàm con bật Tia 3D Vật Lý Động (Dynamic Physics Path + Ghost Ball) từ Offsets_Report_5.txt
+typedef void (*VP4SubFlagFn)(int enabled);
+typedef int  (*VP4GetFlagFn)(void);
 
-struct DiscoveredGlobal {
-    vm_address_t addr;
-    bool isByte;
-    bool isPtrDeref;
-    uint32_t fieldOffset;
-};
-
-#pragma mark - Lớp Giả Lập Thao Tác Vuốt Thanh Cơ (Dùng Cho Auto Shoot / Auto Play)
+#pragma mark - Giả Lập UITouch & UIEvent Đầy Đủ Cho Thanh Kéo Cơ (One Shot / Auto Play)
 
 @interface VP4SyntheticTouch : UITouch
 @property (nonatomic, assign) CGPoint synthLocation;
@@ -52,18 +44,30 @@ struct DiscoveredGlobal {
 - (NSTimeInterval)timestamp { return self.synthTimestamp; }
 @end
 
+@interface VP4SyntheticEvent : UIEvent
+@property (nonatomic, strong) NSSet<UITouch *> *synthTouches;
+@property (nonatomic, assign) NSTimeInterval synthTimestamp;
+@end
+
+@implementation VP4SyntheticEvent
+- (NSSet<UITouch *> *)allTouches { return self.synthTouches; }
+- (NSSet<UITouch *> *)touchesForWindow:(UIWindow *)window { return self.synthTouches; }
+- (NSSet<UITouch *> *)touchesForView:(UIView *)view { return self.synthTouches; }
+- (UIEventType)type { return UIEventTypeTouches; }
+- (UIEventSubtype)subtype { return UIEventSubtypeNone; }
+- (NSTimeInterval)timestamp { return self.synthTimestamp; }
+@end
+
 #pragma mark - Giao Diện & Logic Chính Của Mod Menu
 
 @interface VP4ProModMenu : UIView <UITextFieldDelegate>
 @property (nonatomic, strong) UIButton *floatingIcon;
 @property (nonatomic, strong) UIView *menuPanel;
 @property (nonatomic, strong) UILabel *statusLabel;
-@property (nonatomic, strong) UILabel *powerLabel;
-@property (nonatomic, strong) UISlider *powerSlider;
 @property (nonatomic, strong) UITextField *moneyInput;
 @property (nonatomic, strong) CADisplayLink *engineTimer;
 
-// Lớp thước kẻ 2D phụ (Overlay 2D)
+// Lớp thước kẻ 2D phụ (Tùy chọn)
 @property (nonatomic, strong) CAShapeLayer *line2DAim;
 @property (nonatomic, strong) CAShapeLayer *line2DTarget;
 @property (nonatomic, strong) CAShapeLayer *ghost2DCircle;
@@ -76,12 +80,10 @@ struct DiscoveredGlobal {
 @property (nonatomic, assign) BOOL freeCameraEnabled;
 @property (nonatomic, assign) BOOL overlay2DEnabled;
 @property (nonatomic, assign) BOOL autoPlayEnabled;
-@property (nonatomic, assign) float shotPower; // 0.15 -> 1.0
 @end
 
 @implementation VP4ProModMenu {
     uintptr_t _baseHeader;
-    std::vector<DiscoveredGlobal> _funcGlobals;
     std::vector<vm_address_t> _careerMgrInstances;
     std::vector<vm_address_t> _moneyScanList;
     int _frameCounter;
@@ -96,11 +98,10 @@ struct DiscoveredGlobal {
         self.freeCameraEnabled = NO;
         self.overlay2DEnabled = NO;
         self.autoPlayEnabled = NO;
-        self.shotPower = 0.65f;
         _frameCounter = 0;
         _isStroking = NO;
 
-        [self locateGameBinaryAndDecodeAimFunction];
+        [self locateGameBinary];
         [self setup2DOverlayElements];
         [self setupMenuInterface];
 
@@ -110,15 +111,13 @@ struct DiscoveredGlobal {
     return self;
 }
 
-// Cho phép chạm xuyên qua vùng trống để xoay cơ trong game bình thường
+// Cho phép chạm xuyên qua vùng trống xuống màn hình game
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = [super hitTest:point withEvent:event];
     return (hit == self) ? nil : hit;
 }
 
-#pragma mark - 1. Định Vị Binary & Giải Mã Hàm SetAimAids (0x1001112b8)
-
-- (void)locateGameBinaryAndDecodeAimFunction {
+- (void)locateGameBinary {
     _baseHeader = 0;
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++) {
@@ -131,71 +130,9 @@ struct DiscoveredGlobal {
     if (_baseHeader == 0 && count > 0) {
         _baseHeader = (uintptr_t)_dyld_get_image_header(0);
     }
-    if (_baseHeader == 0) return;
-
-    // Tự động giải mã thân hàm SetAimAids (0x1001112b8) và GetAimFlag (0x10017bdc8) trong RAM
-    uint64_t targetFuncs[] = { 0x1001112b8ULL, 0x10017bdc8ULL };
-    for (uint64_t fnVMA : targetFuncs) {
-        vm_address_t fnStart = VP4Addr(_baseHeader, fnVMA);
-        uint64_t regBase[32] = {0};
-        bool regDeref[32] = {false};
-
-        for (int idx = 0; idx < 80; idx++) {
-            uint32_t insn = *(const uint32_t *)(fnStart + idx * 4);
-            if (insn == 0xd65f03c0) break; // RET
-
-            if ((insn & 0x9f000000) == 0x90000000) { // ADRP Xd, page
-                uint32_t rd = insn & 0x1f;
-                int64_t immlo = (insn >> 29) & 0x3;
-                int64_t immhi = (insn >> 5) & 0x7ffff;
-                int64_t imm = (immhi << 2) | immlo;
-                if (imm & (1LL << 20)) imm -= (1LL << 21);
-                uint64_t pcPage = ((uint64_t)(fnStart + idx * 4)) & ~0xfffULL;
-                regBase[rd] = pcPage + (imm << 12);
-                regDeref[rd] = false;
-            } else if ((insn & 0xff800000) == 0x91000000) { // ADD Xd, Xn, #imm12
-                uint32_t rd = insn & 0x1f;
-                uint32_t rn = (insn >> 5) & 0x1f;
-                uint64_t imm12 = (insn >> 10) & 0xfff;
-                if ((insn >> 22) & 1) imm12 <<= 12;
-                if (regBase[rn] != 0) {
-                    regBase[rd] = regBase[rn] + imm12;
-                    regDeref[rd] = regDeref[rn];
-                }
-            } else if ((insn & 0xffc00000) == 0xf9400000) { // LDR Xd, [Xn, #imm12*8]
-                uint32_t rd = insn & 0x1f;
-                uint32_t rn = (insn >> 5) & 0x1f;
-                uint64_t imm12 = ((insn >> 10) & 0xfff) * 8;
-                if (regBase[rn] != 0 && !regDeref[rn]) {
-                    regBase[rd] = regBase[rn] + imm12;
-                    regDeref[rd] = true;
-                }
-            } else if ((insn & 0xffc00000) == 0xb9000000 || (insn & 0xffc00000) == 0xb9400000) { // STR/LDR Wd, [Xn, #imm12*4]
-                uint32_t rn = (insn >> 5) & 0x1f;
-                uint32_t imm12 = ((insn >> 10) & 0xfff) * 4;
-                if (regBase[rn] != 0) {
-                    if (!regDeref[rn]) {
-                        _funcGlobals.push_back({(vm_address_t)(regBase[rn] + imm12), false, false, 0});
-                    } else {
-                        _funcGlobals.push_back({(vm_address_t)regBase[rn], false, true, imm12});
-                    }
-                }
-            } else if ((insn & 0xffc00000) == 0x39000000 || (insn & 0xffc00000) == 0x39400000) { // STRB/LDRB Wd, [Xn, #imm12]
-                uint32_t rn = (insn >> 5) & 0x1f;
-                uint32_t imm12 = (insn >> 10) & 0xfff;
-                if (regBase[rn] != 0) {
-                    if (!regDeref[rn]) {
-                        _funcGlobals.push_back({(vm_address_t)(regBase[rn] + imm12), true, false, 0});
-                    } else {
-                        _funcGlobals.push_back({(vm_address_t)regBase[rn], true, true, imm12});
-                    }
-                }
-            }
-        }
-    }
 }
 
-// Quét tìm đối tượng cwCareerManager (VTable 0x100fb8988) trong Heap để mở khóa +0x5c = 3 (TrackAll)
+// Quét tìm đối tượng cwCareerManager (VTable 0x100fb8988) để mở khóa giới hạn tia trong Career Mode
 - (void)refreshCareerManagerInstances {
     if (_baseHeader == 0) return;
     _careerMgrInstances.clear();
@@ -231,91 +168,116 @@ struct DiscoveredGlobal {
     }
 }
 
-#pragma mark - 2. Vòng Lặp 60FPS Khóa Cứng Line 3D Gốc (TrackAll) & Camera
+#pragma mark - 1. Bật Tia 3D Vật Lý Động Theo Lực Cơ & Áp-Phê (Chuẩn Offsets_Report_5.txt)
 
-- (void)applyNativeTrackAllNow {
+- (void)enableDynamicPhysicsTrackOnce {
+    if (_baseHeader == 0) return;
+
+    // Gọi trực tiếp 3 hàm con của nhánh w0 == 2 (100111338) mà KHÔNG ghi đè hằng số lực 96.0 vào [0x101293278]+0x8
+    VP4SubFlagFn setAimLine   = (VP4SubFlagFn)VP4Addr(_baseHeader, 0x10017bdbcULL);
+    VP4SubFlagFn setTruePath  = (VP4SubFlagFn)VP4Addr(_baseHeader, 0x1001968c8ULL);
+    VP4SubFlagFn setGhostBall = (VP4SubFlagFn)VP4Addr(_baseHeader, 0x10017bdfcULL);
+
+    setAimLine(1);   // Bật tia ngắm
+    setTruePath(1);  // Bật tính toán vật lý động theo lực cơ kéo, áp-phê, trô, cu-lê!
+    setGhostBall(1); // Bật bóng mờ Ghost Ball tại điểm chạm và điểm dừng
+}
+
+- (void)maintainDynamicTrackFlags {
     if (_baseHeader == 0) return;
     mach_port_t task = mach_task_self();
+    vm_size_t outSize = 0;
 
-    // A. Khóa cấu trúc PlayerProfile / cwTrackSettings tại con trỏ toàn cục 0x1012924b0
+    // 1. Giữ cấu hình trong PlayerProfile (0x1012924b0) ở chế độ TrackingGhostPath (3)
     vm_address_t profilePtrAddr = VP4Addr(_baseHeader, 0x1012924b0ULL);
     uint64_t profileObj = 0;
-    vm_size_t outSize = 0;
     if (vm_read_overwrite(task, profilePtrAddr, sizeof(uint64_t), (vm_address_t)&profileObj, &outSize) == KERN_SUCCESS && profileObj > 0x100000000ULL) {
         if (self.native3DLineEnabled) {
-            uint32_t trackTypeGhostPath = 3; // 3 = TrackingGhostPath (Đủ đường đi + Ghost Ball)
+            uint32_t ghostPathMode = 3; // 3 = TrackingGhostPath_Icon.tga (Quỹ đạo động + Ghost Ball)
             uint32_t one = 1;
-            vm_write(task, (vm_address_t)(profileObj + 0x88), (vm_offset_t)&trackTypeGhostPath, sizeof(uint32_t));
-            vm_write(task, (vm_address_t)(profileObj + 0x8c), (vm_offset_t)&one, sizeof(uint32_t)); // Track AimLine = ON
-            vm_write(task, (vm_address_t)(profileObj + 0xc0), (vm_offset_t)&one, sizeof(uint32_t)); // Track CueBall = ON
+            vm_write(task, (vm_address_t)(profileObj + 0x88), (vm_offset_t)&ghostPathMode, sizeof(uint32_t));
+            vm_write(task, (vm_address_t)(profileObj + 0x8c), (vm_offset_t)&one, sizeof(uint32_t));
+            vm_write(task, (vm_address_t)(profileObj + 0xc0), (vm_offset_t)&one, sizeof(uint32_t));
         }
         if (self.freeCameraEnabled) {
             uint32_t zero = 0;
-            vm_write(task, (vm_address_t)(profileObj + 0x48), (vm_offset_t)&zero, sizeof(uint32_t)); // Restrict Aim Eyepoint = OFF
+            vm_write(task, (vm_address_t)(profileObj + 0x48), (vm_offset_t)&zero, sizeof(uint32_t));
         }
     }
 
     if (!self.native3DLineEnabled) return;
 
-    // B. Khóa các biến toàn cục tìm thấy trong thân hàm 0x1001112b8 & 0x10017bdc8
-    for (const auto &g : _funcGlobals) {
-        vm_address_t writeAddr = g.addr;
-        if (g.isPtrDeref) {
-            uint64_t baseObj = 0;
-            if (vm_read_overwrite(task, g.addr, sizeof(uint64_t), (vm_address_t)&baseObj, &outSize) == KERN_SUCCESS && baseObj > 0x100000000ULL) {
-                writeAddr = (vm_address_t)(baseObj + g.fieldOffset);
-            } else {
-                continue;
-            }
-        }
-        if (g.isByte) {
-            uint8_t val8 = 1;
-            vm_write(task, writeAddr, (vm_offset_t)&val8, sizeof(uint8_t));
-        } else {
-            uint32_t val32 = 3; // 3 = TrackAll
-            vm_write(task, writeAddr, (vm_offset_t)&val32, sizeof(uint32_t));
-        }
+    // 2. Chỉ giữ đúng các byte cờ hiển thị (Tuyệt đối KHÔNG ghi đè biến lực tại 0x101293278)
+    uint8_t one8 = 1;
+    vm_write(task, VP4Addr(_baseHeader, 0x1011bf8d0ULL), (vm_offset_t)&one8, sizeof(uint8_t));
+    vm_write(task, VP4Addr(_baseHeader, 0x10120e2e0ULL), (vm_offset_t)&one8, sizeof(uint8_t));
+
+    // 3. Giữ 2 byte cờ Render tại *(0x101293230) + 0x14 (AimLine) và + 0x15 (Dynamic Physics Path) = 1
+    vm_address_t renderStatePtrAddr = VP4Addr(_baseHeader, 0x101293230ULL);
+    uint64_t renderStateObj = 0;
+    if (vm_read_overwrite(task, renderStatePtrAddr, sizeof(uint64_t), (vm_address_t)&renderStateObj, &outSize) == KERN_SUCCESS && renderStateObj > 0x100000000ULL) {
+        vm_write(task, (vm_address_t)(renderStateObj + 0x14), (vm_offset_t)&one8, sizeof(uint8_t));
+        vm_write(task, (vm_address_t)(renderStateObj + 0x15), (vm_offset_t)&one8, sizeof(uint8_t));
     }
 
-    // C. Khóa offset +0x5c = 3 (TrackAll) trong mọi đối tượng cwCareerManager đang sống
-    uint32_t modeTrackAll = 3;
+    // 4. Giữ chế độ AimMode = 2 (Full Dynamic TrackAll) tại *(0x1012932c8) + 0x148c
+    vm_address_t gamePtrAddr = VP4Addr(_baseHeader, 0x1012932c8ULL);
+    uint64_t gameObj = 0;
+    if (vm_read_overwrite(task, gamePtrAddr, sizeof(uint64_t), (vm_address_t)&gameObj, &outSize) == KERN_SUCCESS && gameObj > 0x100000000ULL) {
+        uint32_t mode2 = 2;
+        vm_write(task, (vm_address_t)(gameObj + 0x148c), (vm_offset_t)&mode2, sizeof(uint32_t));
+    }
+
+    // 5. Mở khóa giới hạn tia trong các đối tượng cwCareerManager (+0x5c = 2)
+    uint32_t careerMode2 = 2;
     for (vm_address_t mgr : _careerMgrInstances) {
-        vm_write(task, mgr + 0x5c, (vm_offset_t)&modeTrackAll, sizeof(uint32_t));
+        vm_write(task, mgr + 0x5c, (vm_offset_t)&careerMode2, sizeof(uint32_t));
     }
 }
 
 - (void)onEngineFrame {
     _frameCounter++;
     if (self.native3DLineEnabled || self.freeCameraEnabled) {
-        [self applyNativeTrackAllNow];
-        // Mỗi 2 giây gọi lại hàm gốc SetAimAids(3) của game để đồng bộ engine vẽ 3D
-        if (self.native3DLineEnabled && (_frameCounter % 120 == 1) && _baseHeader != 0) {
-            VP4SetAimAidsFn setAimFn = (VP4SetAimAidsFn)VP4Addr(_baseHeader, 0x1001112b8ULL);
-            setAimFn(3);
+        [self maintainDynamicTrackFlags];
+        if (self.native3DLineEnabled && (_frameCounter % 90 == 1)) {
+            [self enableDynamicPhysicsTrackOnce];
         }
     }
 
-    // Nếu bật Auto Play, tự động thực hiện cú kéo cơ mỗi 5.5 giây
-    if (self.autoPlayEnabled && !_isStroking && (_frameCounter % 330 == 0)) {
+    // Nếu bật Auto Play, tự động thực hiện cú bắn mỗi 5 giây
+    if (self.autoPlayEnabled && !_isStroking && (_frameCounter % 300 == 0)) {
         [self performAutoCueStroke];
     }
 }
 
-#pragma mark - 3. Chức Năng Auto Play / Auto Cue Stroke (Tự Động Kéo Cơ Bắn Bi)
+#pragma mark - 2. One Shot & Auto Play (Giả Lập Kéo Thanh Cơ Với UIEvent Thực)
 
-- (UIView *)findGameRenderView:(UIView *)root {
-    for (UIView *sub in root.subviews) {
-        if ([sub isKindOfClass:[VP4ProModMenu class]]) continue;
-        NSString *clsName = NSStringFromClass([sub class]);
-        if ([clsName containsString:@"GL"] || [clsName containsString:@"EAGL"] || sub.subviews.count == 0) {
-            if (sub.bounds.size.width > 200 && sub.bounds.size.height > 200) {
-                return sub;
-            }
-        }
-        UIView *found = [self findGameRenderView:sub];
-        if (found) return found;
+- (void)sendTouchPhase:(UITouchPhase)phase
+                 touch:(VP4SyntheticTouch *)touch
+                 event:(VP4SyntheticEvent *)event
+              location:(CGPoint)loc
+            targetView:(UIView *)targetView {
+    NSTimeInterval now = [[NSProcessInfo processInfo] systemUptime];
+    touch.synthPrevLocation = touch.synthLocation;
+    touch.synthLocation = loc;
+    touch.synthPhase = phase;
+    touch.synthTimestamp = now;
+    event.synthTimestamp = now;
+
+    NSSet *touches = [NSSet setWithObject:touch];
+    event.synthTouches = touches;
+
+    // Gửi tới cả targetView, gestureRecognizers và UIResponder chain của game
+    for (UIGestureRecognizer *gr in targetView.gestureRecognizers) {
+        if (!gr.enabled) continue;
+        if (phase == UITouchPhaseBegan) [gr touchesBegan:touches withEvent:event];
+        else if (phase == UITouchPhaseMoved) [gr touchesMoved:touches withEvent:event];
+        else if (phase == UITouchPhaseEnded) [gr touchesEnded:touches withEvent:event];
     }
-    return root;
+
+    if (phase == UITouchPhaseBegan) [targetView touchesBegan:touches withEvent:event];
+    else if (phase == UITouchPhaseMoved) [targetView touchesMoved:touches withEvent:event];
+    else if (phase == UITouchPhaseEnded) [targetView touchesEnded:touches withEvent:event];
 }
 
 - (void)performAutoCueStroke {
@@ -323,68 +285,63 @@ struct DiscoveredGlobal {
     _isStroking = YES;
 
     UIWindow *win = self.window;
-    UIView *gameView = [self findGameRenderView:win];
     CGFloat W = win.bounds.size.width;
     CGFloat H = win.bounds.size.height;
 
-    // Tọa độ thanh kéo cơ (Cue Stick Slider) nằm dọc bên mép phải màn hình
-    CGFloat sliderX = W - 26.0;
-    CGFloat startY  = H * 0.44;
-    CGFloat pullY   = startY + (H * 0.36) * self.shotPower; // Kéo xuống theo % lực
-    CGFloat hitY    = H * 0.18;                             // Đẩy mạnh lên để chạm bi
+    // Vị trí tâm thanh kéo cơ bên phải màn hình
+    CGFloat sliderX = W - 22.0;
+    CGFloat startY  = H * 0.46;
+    CGFloat pullY   = H * 0.72; // Kéo xuống vừa phải
+    CGFloat hitY    = H * 0.16; // Đẩy nhanh lên để ra cơ
+
+    // Tạm ẩn lớp Mod Menu trong tích tắc để lấy đúng UIView của game qua hitTest
+    BOOL wasMenuHidden = self.hidden;
+    self.hidden = YES;
+    UIView *targetView = [win hitTest:CGPointMake(sliderX, startY) withEvent:nil];
+    self.hidden = wasMenuHidden;
+    if (!targetView) targetView = win.rootViewController.view ?: win;
 
     VP4SyntheticTouch *touch = [[VP4SyntheticTouch alloc] init];
     touch.synthWindow = win;
-    touch.synthView = gameView;
+    touch.synthView = targetView;
     touch.synthLocation = CGPointMake(sliderX, startY);
     touch.synthPrevLocation = CGPointMake(sliderX, startY);
-    touch.synthPhase = UITouchPhaseBegan;
-    touch.synthTimestamp = [[NSProcessInfo processInfo] systemUptime];
 
-    NSSet *touchSet = [NSSet setWithObject:touch];
-    [gameView touchesBegan:touchSet withEvent:nil];
+    VP4SyntheticEvent *event = [[VP4SyntheticEvent alloc] init];
 
-    // Giai đoạn 1: Kéo cơ lùi về sau (8 bước)
-    int pullSteps = 8;
+    // Bắt đầu chạm vào thanh cơ
+    [self sendTouchPhase:UITouchPhaseBegan touch:touch event:event location:CGPointMake(sliderX, startY) targetView:targetView];
+
+    // Kéo cơ xuống (10 bước mượt)
+    int pullSteps = 10;
     for (int i = 1; i <= pullSteps; i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 22 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
-            touch.synthPrevLocation = touch.synthLocation;
-            CGFloat curY = startY + (pullY - startY) * ((CGFloat)i / pullSteps);
-            touch.synthLocation = CGPointMake(sliderX, curY);
-            touch.synthPhase = UITouchPhaseMoved;
-            touch.synthTimestamp = [[NSProcessInfo processInfo] systemUptime];
-            [gameView touchesMoved:touchSet withEvent:nil];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 25 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+            CGFloat y = startY + (pullY - startY) * ((CGFloat)i / pullSteps);
+            [self sendTouchPhase:UITouchPhaseMoved touch:touch event:event location:CGPointMake(sliderX, y) targetView:targetView];
         });
     }
 
-    // Giai đoạn 2: Đẩy cơ tới trước dứt khoát để bắn bi
-    int pushStartMs = (pullSteps + 2) * 22;
-    int pushSteps = 4;
+    // Giữ nhịp ngắm rồi đẩy cơ lên dứt khoát (5 bước nhanh)
+    int pushStartMs = (pullSteps + 3) * 25;
+    int pushSteps = 5;
     for (int j = 1; j <= pushSteps; j++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((pushStartMs + j * 12) * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
-            touch.synthPrevLocation = touch.synthLocation;
-            CGFloat curY = pullY + (hitY - pullY) * ((CGFloat)j / pushSteps);
-            touch.synthLocation = CGPointMake(sliderX, curY);
-            touch.synthPhase = UITouchPhaseMoved;
-            touch.synthTimestamp = [[NSProcessInfo processInfo] systemUptime];
-            [gameView touchesMoved:touchSet withEvent:nil];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((pushStartMs + j * 10) * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+            CGFloat y = pullY + (hitY - pullY) * ((CGFloat)j / pushSteps);
+            [self sendTouchPhase:UITouchPhaseMoved touch:touch event:event location:CGPointMake(sliderX, y) targetView:targetView];
         });
     }
 
-    // Giai đoạn 3: Nhả tay kết thúc cú đánh
-    int endMs = pushStartMs + (pushSteps + 1) * 12;
+    // Nhả tay kết thúc cú bắn
+    int endMs = pushStartMs + (pushSteps + 1) * 10;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(endMs * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
-        touch.synthPrevLocation = touch.synthLocation;
-        touch.synthPhase = UITouchPhaseEnded;
-        touch.synthTimestamp = [[NSProcessInfo processInfo] systemUptime];
-        [gameView touchesEnded:touchSet withEvent:nil];
+        [self sendTouchPhase:UITouchPhaseEnded touch:touch event:event location:CGPointMake(sliderX, hitY) targetView:targetView];
         _isStroking = NO;
     });
 
-    self.statusLabel.text = [NSString stringWithFormat:@"⚡ Đã thực hiện cú bắn tự động (Lực: %.0f%%)!", self.shotPower * 100.0f];
+    self.statusLabel.text = [NSString stringWithFormat:@"⚡ Đã gửi thao tác kéo cơ lên [%@]!", NSStringFromClass([targetView class])];
 }
 
-#pragma mark - 4. Chức Năng Mod Tiền (VTable 10CareerPlay 0x100fba2b8 + Quét RAM)
+#pragma mark - 3. Mod Tiền Career Mode (VTable 10CareerPlay + Quét RAM)
 
 - (void)modCareerCashInstant9999999 {
     if (_baseHeader == 0) return;
@@ -433,14 +390,13 @@ struct DiscoveredGlobal {
         addr += size;
     }
 
-    // Đồng thời nếu đã quét RAM thủ công thì ghi đè luôn
     int manualCount = 0;
     int32_t rich = 9999999;
     for (vm_address_t a : _moneyScanList) {
         if (vm_write(task, a, (vm_offset_t)&rich, 4) == KERN_SUCCESS) manualCount++;
     }
 
-    self.statusLabel.text = [NSString stringWithFormat:@"💰 Đã bơm 9,999,999$ (CareerPlay Struct: %d | RAM Scan: %d)!", patchedCareerStructs, manualCount];
+    self.statusLabel.text = [NSString stringWithFormat:@"💰 Đã bơm 9,999,999$ (CareerPlay: %d | RAM Scan: %d)!", patchedCareerStructs, manualCount];
 }
 
 - (void)scanMoneyRAM:(int32_t)targetVal isFirst:(BOOL)first {
@@ -489,7 +445,7 @@ struct DiscoveredGlobal {
     self.statusLabel.text = [NSString stringWithFormat:@"🔍 Quét số %d: Tìm thấy %lu địa chỉ khớp.", targetVal, (unsigned long)_moneyScanList.size()];
 }
 
-#pragma mark - 5. Thước Kẻ 2D Phụ (Overlay 2D Tùy Chọn)
+#pragma mark - 4. Thước Kẻ 2D Phụ (Overlay 2D)
 
 - (UIView *)create2DHandle:(UIColor *)color center:(CGPoint)pt title:(NSString *)title {
     UIView *h = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 32, 32)];
@@ -568,7 +524,7 @@ struct DiscoveredGlobal {
     self.ghost2DCircle.path = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(pGhost.x - R, pGhost.y - R, R * 2, R * 2)].CGPath;
 }
 
-#pragma mark - 6. Khởi Tạo Giao Diện Menu Đầy Đủ Chức Năng
+#pragma mark - 5. Giao Diện Menu (Đã Bỏ Thanh Chỉnh Lực)
 
 - (UIButton *)createBtn:(NSString *)title frame:(CGRect)frame action:(SEL)sel {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -585,7 +541,6 @@ struct DiscoveredGlobal {
 }
 
 - (void)setupMenuInterface {
-    // Nút Icon nổi 🎱
     self.floatingIcon = [UIButton buttonWithType:UIButtonTypeCustom];
     self.floatingIcon.frame = CGRectMake(20, 42, 46, 46);
     self.floatingIcon.backgroundColor = [UIColor colorWithRed:0.05 green:0.10 blue:0.18 alpha:0.94];
@@ -600,8 +555,7 @@ struct DiscoveredGlobal {
     [self.floatingIcon addGestureRecognizer:iconPan];
     [self addSubview:self.floatingIcon];
 
-    // Bảng Menu chính
-    self.menuPanel = [[UIView alloc] initWithFrame:CGRectMake(75, 15, 340, 330)];
+    self.menuPanel = [[UIView alloc] initWithFrame:CGRectMake(75, 20, 340, 300)];
     self.menuPanel.backgroundColor = [UIColor colorWithRed:0.05 green:0.07 blue:0.12 alpha:0.96];
     self.menuPanel.layer.cornerRadius = 14;
     self.menuPanel.layer.borderWidth = 1.5;
@@ -611,7 +565,7 @@ struct DiscoveredGlobal {
 
     UILabel *header = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 340, 30)];
     header.backgroundColor = [UIColor colorWithRed:0.0 green:0.45 blue:0.70 alpha:0.4];
-    header.text = @"  🎱 VIRTUAL POOL 4 - ALL-IN-ONE MOD MENU";
+    header.text = @"  🎱 VIRTUAL POOL 4 - PRO MOD MENU";
     header.textColor = [UIColor cyanColor];
     header.font = [UIFont boldSystemFontOfSize:12];
     header.userInteractionEnabled = YES;
@@ -619,8 +573,8 @@ struct DiscoveredGlobal {
     [self.menuPanel addGestureRecognizer:menuPan];
     [self.menuPanel addSubview:header];
 
-    // --- MỤC 1: LINE 3D GỐC & CAMERA ---
-    [self createBtn:@"1. Line 3D Gốc (TrackAll): OFF"
+    // --- MỤC 1: LINE 3D GỐC THEO LỰC CƠ & ÁP-PHÊ ---
+    [self createBtn:@"1. Line 3D Động (Theo Lực Cơ): OFF"
               frame:CGRectMake(10, 36, 210, 32)
              action:@selector(onToggleNative3DLine:)];
 
@@ -628,7 +582,7 @@ struct DiscoveredGlobal {
               frame:CGRectMake(225, 36, 105, 32)
              action:@selector(onToggleFreeCam:)];
 
-    [self createBtn:@"Kích Hoạt Lại Tia 3D Trong Trận"
+    [self createBtn:@"Làm Mới Tia 3D Trong Trận"
               frame:CGRectMake(10, 72, 210, 28)
              action:@selector(onForceRefresh3DTrack)];
 
@@ -636,44 +590,31 @@ struct DiscoveredGlobal {
               frame:CGRectMake(225, 72, 105, 28)
              action:@selector(onToggle2DOverlay:)];
 
-    // --- MỤC 2: AUTO PLAY / TỰ BẮN BI ---
+    // --- MỤC 2: ONE SHOT & AUTO PLAY (ĐÃ BỎ THANH LỰC) ---
     UIView *div1 = [[UIView alloc] initWithFrame:CGRectMake(10, 106, 320, 1)];
     div1.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.18];
     [self.menuPanel addSubview:div1];
 
-    self.powerLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 110, 140, 20)];
-    self.powerLabel.text = @"⚡ Lực Bắn Auto: 65%";
-    self.powerLabel.textColor = [UIColor yellowColor];
-    self.powerLabel.font = [UIFont boldSystemFontOfSize:11];
-    [self.menuPanel addSubview:self.powerLabel];
-
-    self.powerSlider = [[UISlider alloc] initWithFrame:CGRectMake(145, 108, 185, 24)];
-    self.powerSlider.minimumValue = 0.15f;
-    self.powerSlider.maximumValue = 1.00f;
-    self.powerSlider.value = 0.65f;
-    [self.powerSlider addTarget:self action:@selector(onPowerChanged:) forControlEvents:UIControlEventValueChanged];
-    [self.menuPanel addSubview:self.powerSlider];
-
-    [self createBtn:@"🔥 BẮN NGAY 1 CƠ (AUTO SHOT)"
-              frame:CGRectMake(10, 136, 195, 32)
+    [self createBtn:@"🔥 BẮN NGAY 1 CƠ (ONE SHOT)"
+              frame:CGRectMake(10, 112, 195, 32)
              action:@selector(performAutoCueStroke)];
 
     [self createBtn:@"🤖 Auto Play: OFF"
-              frame:CGRectMake(210, 136, 120, 32)
+              frame:CGRectMake(210, 112, 120, 32)
              action:@selector(onToggleAutoPlay:)];
 
     // --- MỤC 3: MOD TIỀN CAREER MODE ---
-    UIView *div2 = [[UIView alloc] initWithFrame:CGRectMake(10, 174, 320, 1)];
+    UIView *div2 = [[UIView alloc] initWithFrame:CGRectMake(10, 150, 320, 1)];
     div2.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.18];
     [self.menuPanel addSubview:div2];
 
-    UILabel *mLbl = [[UILabel alloc] initWithFrame:CGRectMake(10, 178, 320, 18)];
+    UILabel *mLbl = [[UILabel alloc] initWithFrame:CGRectMake(10, 154, 320, 18)];
     mLbl.text = @"💰 MOD TIỀN CAREER (BẤM NHANH HOẶC QUÉT SỐ):";
     mLbl.textColor = [UIColor greenColor];
     mLbl.font = [UIFont boldSystemFontOfSize:10.5];
     [self.menuPanel addSubview:mLbl];
 
-    self.moneyInput = [[UITextField alloc] initWithFrame:CGRectMake(10, 200, 110, 28)];
+    self.moneyInput = [[UITextField alloc] initWithFrame:CGRectMake(10, 176, 110, 28)];
     self.moneyInput.backgroundColor = [UIColor colorWithWhite:0.15 alpha:1.0];
     self.moneyInput.textColor = [UIColor whiteColor];
     self.moneyInput.placeholder = @"VD: 1500";
@@ -683,24 +624,23 @@ struct DiscoveredGlobal {
     self.moneyInput.delegate = self;
     [self.menuPanel addSubview:self.moneyInput];
 
-    [self createBtn:@"Quét Tiền" frame:CGRectMake(126, 200, 98, 28) action:@selector(onScanMoneyFirst)];
-    [self createBtn:@"Lọc Tiền" frame:CGRectMake(230, 200, 100, 28) action:@selector(onScanMoneyFilter)];
+    [self createBtn:@"Quét Tiền" frame:CGRectMake(126, 176, 98, 28) action:@selector(onScanMoneyFirst)];
+    [self createBtn:@"Lọc Tiền" frame:CGRectMake(230, 176, 100, 28) action:@selector(onScanMoneyFilter)];
 
     UIButton *cashBtn = [self createBtn:@"💎 BƠM TIỀN -> 9,999,999$ (AUTO + RAM)"
-                                  frame:CGRectMake(10, 234, 320, 32)
+                                  frame:CGRectMake(10, 210, 320, 32)
                                  action:@selector(modCareerCashInstant9999999)];
     cashBtn.backgroundColor = [UIColor colorWithRed:0.55 green:0.35 blue:0.0 alpha:0.95];
 
-    // Thanh trạng thái
-    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 272, 320, 50)];
-    self.statusLabel.text = [NSString stringWithFormat:@"✅ Đã nạp %lu biến gốc từ hàm SetAimAids (0x1001112b8).\nBấm [1. Line 3D Gốc] để mở toàn bộ tia ngắm 3D & bóng mờ!", (unsigned long)_funcGlobals.size()];
+    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 246, 320, 48)];
+    self.statusLabel.text = @"✅ Đã kích hoạt chế độ Dynamic GhostPath (0x1001968c8).\nTia 3D và bóng mờ sẽ tự co giãn theo đúng lực kéo cơ, áp-phê & trô!";
     self.statusLabel.textColor = [UIColor cyanColor];
     self.statusLabel.font = [UIFont systemFontOfSize:10];
     self.statusLabel.numberOfLines = 3;
     [self.menuPanel addSubview:self.statusLabel];
 }
 
-#pragma mark - Sự Kiện Nút Bấm
+#pragma mark - Xử Lý Sự Kiện
 
 - (void)toggleMenu {
     [self endEditing:YES];
@@ -723,37 +663,31 @@ struct DiscoveredGlobal {
 - (void)onToggleNative3DLine:(UIButton *)btn {
     self.native3DLineEnabled = !self.native3DLineEnabled;
     if (self.native3DLineEnabled) {
-        [btn setTitle:@"1. Line 3D Gốc (TrackAll): ON" forState:UIControlStateNormal];
+        [btn setTitle:@"1. Line 3D Động (Theo Lực Cơ): ON" forState:UIControlStateNormal];
         btn.backgroundColor = [UIColor colorWithRed:0.0 green:0.65 blue:0.35 alpha:0.95];
         [self refreshCareerManagerInstances];
-        [self applyNativeTrackAllNow];
-        if (_baseHeader != 0) {
-            VP4SetAimAidsFn setAimFn = (VP4SetAimAidsFn)VP4Addr(_baseHeader, 0x1001112b8ULL);
-            setAimFn(3); // Gọi thẳng hàm gốc của game: 3 = TrackAll
-        }
-        self.statusLabel.text = [NSString stringWithFormat:@"🔥 Đã bật TrackAll (0x1001112b8) + khóa %lu phòng Career!\nHãy nhích nhẹ cơ để tia 3D & bóng mờ hiện lên.", (unsigned long)_careerMgrInstances.size()];
+        [self enableDynamicPhysicsTrackOnce];
+        [self maintainDynamicTrackFlags];
+        self.statusLabel.text = [NSString stringWithFormat:@"🔥 Đã bật Line 3D Vật Lý Động (nhánh w0=2, khóa %lu phòng)!\nKéo nhẹ/mạnh thanh cơ hoặc chỉnh áp-phê để thấy tia thay đổi theo lực.", (unsigned long)_careerMgrInstances.size()];
     } else {
-        [btn setTitle:@"1. Line 3D Gốc (TrackAll): OFF" forState:UIControlStateNormal];
+        [btn setTitle:@"1. Line 3D Động (Theo Lực Cơ): OFF" forState:UIControlStateNormal];
         btn.backgroundColor = [UIColor colorWithWhite:0.18 alpha:0.95];
-        self.statusLabel.text = @"Đã tắt khóa Line 3D Gốc.";
+        self.statusLabel.text = @"Đã tắt khóa Line 3D Động.";
     }
 }
 
 - (void)onForceRefresh3DTrack {
     [self refreshCareerManagerInstances];
-    [self applyNativeTrackAllNow];
-    if (_baseHeader != 0) {
-        VP4SetAimAidsFn setAimFn = (VP4SetAimAidsFn)VP4Addr(_baseHeader, 0x1001112b8ULL);
-        setAimFn(3);
-    }
-    self.statusLabel.text = [NSString stringWithFormat:@"🔄 Đã làm mới hàm SetAimAids(3) & %lu đối tượng Career!", (unsigned long)_careerMgrInstances.size()];
+    [self enableDynamicPhysicsTrackOnce];
+    [self maintainDynamicTrackFlags];
+    self.statusLabel.text = [NSString stringWithFormat:@"🔄 Đã làm mới tia 3D động & %lu phòng Career!", (unsigned long)_careerMgrInstances.size()];
 }
 
 - (void)onToggleFreeCam:(UIButton *)btn {
     self.freeCameraEnabled = !self.freeCameraEnabled;
     [btn setTitle:(self.freeCameraEnabled ? @"Mở Góc Camera: ON" : @"Mở Góc Camera: OFF") forState:UIControlStateNormal];
     btn.backgroundColor = self.freeCameraEnabled ? [UIColor colorWithRed:0.0 green:0.55 blue:0.65 alpha:0.95] : [UIColor colorWithWhite:0.18 alpha:0.95];
-    [self applyNativeTrackAllNow];
+    [self maintainDynamicTrackFlags];
 }
 
 - (void)onToggle2DOverlay:(UIButton *)btn {
@@ -769,16 +703,11 @@ struct DiscoveredGlobal {
     [self update2DOverlayLines];
 }
 
-- (void)onPowerChanged:(UISlider *)slider {
-    self.shotPower = slider.value;
-    self.powerLabel.text = [NSString stringWithFormat:@"⚡ Lực Bắn Auto: %.0f%%", self.shotPower * 100.0f];
-}
-
 - (void)onToggleAutoPlay:(UIButton *)btn {
     self.autoPlayEnabled = !self.autoPlayEnabled;
     [btn setTitle:(self.autoPlayEnabled ? @"🤖 Auto Play: ON" : @"🤖 Auto Play: OFF") forState:UIControlStateNormal];
     btn.backgroundColor = self.autoPlayEnabled ? [UIColor colorWithRed:0.75 green:0.25 blue:0.15 alpha:0.95] : [UIColor colorWithWhite:0.18 alpha:0.95];
-    self.statusLabel.text = self.autoPlayEnabled ? @"🤖 Đang bật Auto Play: Tự động kéo cơ bắn mỗi 5.5 giây!" : @"Đã dừng Auto Play.";
+    self.statusLabel.text = self.autoPlayEnabled ? @"🤖 Đang bật Auto Play: Tự động ra cơ mỗi 5 giây!" : @"Đã dừng Auto Play.";
 }
 
 - (void)onScanMoneyFirst {
