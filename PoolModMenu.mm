@@ -7,9 +7,9 @@
 #import <vector>
 #import <algorithm>
 
-struct TrackMemItem {
+struct TrackByteItem {
     vm_address_t addr;
-    uint32_t onVal;
+    uint8_t onVal;
 };
 
 @interface VP4NativeModView : UIView <UITextFieldDelegate>
@@ -20,14 +20,14 @@ struct TrackMemItem {
 @property (nonatomic, strong) UITextField *moneyInput;
 @property (nonatomic, strong) CADisplayLink *freezeTimer;
 @property (nonatomic, assign) BOOL lockNativeTrack;
+@property (nonatomic, assign) int forceMode; // 0: Giữ nguyên onVal, 1: Ép = 1, 2: Ép = 2 (TrackAll)
 @end
 
 @implementation VP4NativeModView {
-    std::vector<TrackMemItem> _candidates;
-    std::vector<TrackMemItem> _lockedAddrs;
+    std::vector<TrackByteItem> _candidates;
+    std::vector<TrackByteItem> _lockedAddrs;
     std::vector<vm_address_t> _moneyAddrs;
     intptr_t _slide;
-    vm_address_t _textStart, _textEnd;
     vm_address_t _dataStart, _dataEnd;
     int _scanStep;
 }
@@ -37,6 +37,7 @@ struct TrackMemItem {
     if (self) {
         self.backgroundColor = [UIColor clearColor];
         self.lockNativeTrack = NO;
+        self.forceMode = 0;
         _scanStep = 0;
         [self parseBinarySegments];
         [self setupMenuUI];
@@ -64,10 +65,7 @@ struct TrackMemItem {
                 const struct load_command *lc = (const struct load_command *)p;
                 if (lc->cmd == LC_SEGMENT_64) {
                     const struct segment_command_64 *seg = (const struct segment_command_64 *)p;
-                    if (strcmp(seg->segname, "__TEXT") == 0) {
-                        _textStart = (vm_address_t)(seg->vmaddr + _slide);
-                        _textEnd   = _textStart + (vm_size_t)seg->vmsize;
-                    } else if (strcmp(seg->segname, "__DATA") == 0) {
+                    if (strcmp(seg->segname, "__DATA") == 0) {
                         _dataStart = (vm_address_t)(seg->vmaddr + _slide);
                         _dataEnd   = _dataStart + (vm_size_t)seg->vmsize;
                     }
@@ -83,70 +81,84 @@ struct TrackMemItem {
     if (!self.lockNativeTrack || _lockedAddrs.empty()) return;
     mach_port_t task = mach_task_self();
     for (const auto &item : _lockedAddrs) {
-        uint32_t val = item.onVal;
-        vm_write(task, item.addr, (vm_offset_t)&val, sizeof(uint32_t));
+        uint8_t val = item.onVal;
+        if (self.forceMode == 1) val = 1;
+        else if (self.forceMode == 2) val = 2;
+        vm_write(task, item.addr, (vm_offset_t)&val, sizeof(uint8_t));
     }
 }
 
-#pragma mark - Quét 32-bit Int Chuẩn C++ (Track Type / Track AimLine / Track CueBall)
+#pragma mark - Quét Từng Byte Chuẩn Xác (Bắt cả Bool 1-byte và Enum TrackAll = 2, AimLine = 1, NoAim = 0)
 
-// Bước 1: Quét khi đang ở bàn Practice / Quick Play CÓ ĐỦ TIA 3D ĐỎ/TRẮNG
 - (void)step1ScanFullTrack {
     _candidates.clear();
     mach_port_t task = mach_task_self();
 
+    // 1. Quét toàn bộ phân vùng __DATA + __BSS của Binary trước tiên (đưa lên đầu danh sách)
+    if (_dataStart != 0 && _dataEnd > _dataStart) {
+        vm_size_t dSize = _dataEnd - _dataStart;
+        std::vector<uint8_t> buf(dSize);
+        vm_size_t out = 0;
+        if (vm_read_overwrite(task, _dataStart, dSize, (vm_address_t)buf.data(), &out) == KERN_SUCCESS) {
+            for (vm_size_t i = 0; i < out; i++) {
+                uint8_t v = buf[i];
+                if (v >= 1 && v <= 4) {
+                    _candidates.push_back({_dataStart + i, v});
+                }
+            }
+        }
+    }
+
+    // 2. Quét thêm vùng nhớ Heap chứa đối tượng cwTrackSettings / CareerPlay
     vm_address_t addr = 0;
     vm_size_t size = 0;
-    while (true) {
+    while (_candidates.size() < 600000) {
         vm_region_basic_info_data_64_t info;
         mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
         mach_port_t obj = MACH_PORT_NULL;
         if (vm_region_64(task, &addr, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &obj) != KERN_SUCCESS) break;
 
         BOOL rw = (info.protection & VM_PROT_READ) && (info.protection & VM_PROT_WRITE);
-        // Quét vùng __DATA và các vùng Heap chứa cấu hình ván đấu
-        if (rw && size <= 32 * 1024 * 1024) {
+        if (rw && size <= 16 * 1024 * 1024 && (addr < _dataStart || addr >= _dataEnd)) {
             const vm_size_t chunk = 65536;
             std::vector<uint8_t> buf(chunk);
             for (vm_size_t off = 0; off < size; off += chunk) {
                 vm_size_t rSize = MIN(chunk, size - off);
                 vm_size_t out = 0;
                 if (vm_read_overwrite(task, addr + off, rSize, (vm_address_t)buf.data(), &out) == KERN_SUCCESS) {
-                    for (vm_size_t i = 0; i + 4 <= out; i += 4) {
-                        uint32_t v = *(uint32_t *)(buf.data() + i);
-                        // Trong Virtual Pool 4: TrackAll / Track AimLine / Track CueBall là int32 từ 1 đến 4
+                    for (vm_size_t i = 0; i < out; i++) {
+                        uint8_t v = buf[i];
                         if (v >= 1 && v <= 4) {
                             _candidates.push_back({addr + off + i, v});
-                            if (_candidates.size() >= 350000) break;
+                            if (_candidates.size() >= 600000) break;
                         }
                     }
                 }
-                if (_candidates.size() >= 350000) break;
+                if (_candidates.size() >= 600000) break;
             }
         }
         addr += size;
-        if (_candidates.size() >= 350000) break;
     }
 
     _scanStep = 1;
-    self.statusLabel.text = [NSString stringWithFormat:@"✅ BƯỚC 1 XONG (%lu biến).\nBây giờ hãy vào trận Career (bị mất tia) rồi bấm [BƯỚC 2: Lọc Khi Mất Tia]!", (unsigned long)_candidates.size()];
+    self.statusLabel.text = [NSString stringWithFormat:@"✅ B1 XONG (%lu biến).\nGiờ vào trận mất tia (hoặc tắt Track trong Menu game) rồi bấm [B2: Lọc Mất Tia]!", (unsigned long)_candidates.size()];
 }
 
-// Bước 2: Lọc khi ở trong Career Mode (Mất tia -> Giá trị giảm về 0)
+// Bước 2: Bắt cả trường hợp về 0 (No AimAids) HOẶC giảm từ 2 xuống 1 (từ TrackAll về AimLine ngắn)
 - (void)step2FilterNoTrack {
     if (_scanStep < 1 || _candidates.empty()) {
-        self.statusLabel.text = @"⚠️ Bạn phải vào màn CÓ TIA bấm [BƯỚC 1] trước, rồi mới sang màn mất tia bấm [BƯỚC 2]!";
+        self.statusLabel.text = @"⚠️ Hãy bấm [B1: Quét Có Tia] ở màn có đủ tia trước!";
         return;
     }
 
-    std::vector<TrackMemItem> filtered;
+    std::vector<TrackByteItem> filtered;
     mach_port_t task = mach_task_self();
     for (const auto &item : _candidates) {
-        uint32_t cur = 999;
+        uint8_t cur = 255;
         vm_size_t out = 0;
-        if (vm_read_overwrite(task, item.addr, sizeof(uint32_t), (vm_address_t)&cur, &out) == KERN_SUCCESS) {
-            // Khi mất tia (No AimAids hoặc chỉ còn AimLine ngắn), giá trị về 0 hoặc nhỏ hơn lúc TrackAll
-            if (cur == 0) {
+        if (vm_read_overwrite(task, item.addr, sizeof(uint8_t), (vm_address_t)&cur, &out) == KERN_SUCCESS) {
+            // Chấp nhận cur == 0 HOẶC cur < onVal (ví dụ TrackAll=2 giảm xuống AimLine=1)
+            if (cur < item.onVal) {
                 filtered.push_back(item);
             }
         }
@@ -154,37 +166,43 @@ struct TrackMemItem {
 
     _candidates = filtered;
     _scanStep = 2;
-    self.statusLabel.text = [NSString stringWithFormat:@"🎯 BƯỚC 2 XONG: Đã lọc còn %lu biến.\nNếu số này > 100, hãy quay lại bàn CÓ TIA bấm [BƯỚC 2B] rồi quay lại Career bấm [BƯỚC 2] lần nữa!", (unsigned long)_candidates.size()];
+    self.statusLabel.text = [NSString stringWithFormat:@"🎯 B2 XONG: Còn %lu biến (đã tính cả AimLine=1).\nQuay lại bàn CÓ TIA bấm [B2B] để lọc chuẩn!", (unsigned long)_candidates.size()];
 }
 
-// Bước 2B: Lọc lặp lại khi bật lại Tia
 - (void)step2BFilterTrackAgain {
     if (_candidates.empty()) return;
 
-    std::vector<TrackMemItem> filtered;
+    std::vector<TrackByteItem> filtered;
     mach_port_t task = mach_task_self();
     for (const auto &item : _candidates) {
-        uint32_t cur = 0;
+        uint8_t cur = 0;
         vm_size_t out = 0;
-        if (vm_read_overwrite(task, item.addr, sizeof(uint32_t), (vm_address_t)&cur, &out) == KERN_SUCCESS) {
-            if (cur == item.onVal && cur >= 1 && cur <= 4) {
+        if (vm_read_overwrite(task, item.addr, sizeof(uint8_t), (vm_address_t)&cur, &out) == KERN_SUCCESS) {
+            if (cur == item.onVal) {
                 filtered.push_back(item);
             }
         }
     }
 
     _candidates = filtered;
-    self.statusLabel.text = [NSString stringWithFormat:@"🔥 BƯỚC 2B XONG: Chỉ còn %lu biến chuẩn xác!\nBấm [BƯỚC 3: BẬT KHÓA TIA 3D] ngay!", (unsigned long)_candidates.size()];
+
+    // Đếm xem có bao nhiêu biến nằm thẳng trong vùng __DATA gốc của game
+    int inDataSeg = 0;
+    for (const auto &item : _candidates) {
+        if (item.addr >= _dataStart && item.addr < _dataEnd) inDataSeg++;
+    }
+
+    self.statusLabel.text = [NSString stringWithFormat:@"🔥 B2B XONG: Còn %lu biến (Trong __DATA: %d biến)!\nBấm [BƯỚC 3: KHÓA TIA 3D] ngay!", (unsigned long)_candidates.size(), inDataSeg];
 }
 
 - (void)step3ToggleLock:(UIButton *)btn {
     if (!self.lockNativeTrack) {
         if (_scanStep < 2) {
-            self.statusLabel.text = @"❌ Chưa lọc Bước 2! Bạn đang có quá nhiều biến, phải bấm [BƯỚC 2: Lọc Khi Mất Tia] trước khi Khóa!";
+            self.statusLabel.text = @"❌ Bạn phải lọc qua Bước 2 trước khi Khóa!";
             return;
         }
         _lockedAddrs.clear();
-        size_t limit = std::min(_candidates.size(), (size_t)200);
+        size_t limit = std::min(_candidates.size(), (size_t)2500);
         for (size_t i = 0; i < limit; i++) {
             _lockedAddrs.push_back(_candidates[i]);
         }
@@ -193,13 +211,20 @@ struct TrackMemItem {
         btn.backgroundColor = [UIColor colorWithRed:0.0 green:0.65 blue:0.35 alpha:0.95];
 
         uint64_t off = (_lockedAddrs.empty()) ? 0 : (uint64_t)(_lockedAddrs[0].addr - _slide);
-        self.statusLabel.text = [NSString stringWithFormat:@"🔒 Đang khóa cứng %lu biến TrackAll (Offset: 0x%llX).\nHãy xoay nhẹ cơ để game vẽ lại tia 3D!", (unsigned long)_lockedAddrs.size(), off];
+        self.statusLabel.text = [NSString stringWithFormat:@"🔒 Đang khóa %lu biến (Offset đầu: 0x%llX).\nNếu chưa hiện tia đỏ, bấm thử nút [Ép Kiểu: Auto / 1 / 2] bên dưới!", (unsigned long)_lockedAddrs.size(), off];
     } else {
         self.lockNativeTrack = NO;
         [btn setTitle:@"BƯỚC 3: KHÓA BẬT TIA 3D (OFF)" forState:UIControlStateNormal];
         btn.backgroundColor = [UIColor colorWithWhite:0.22 alpha:0.95];
         self.statusLabel.text = @"Đã tắt khóa tia 3D.";
     }
+}
+
+- (void)cycleForceMode:(UIButton *)btn {
+    self.forceMode = (self.forceMode + 1) % 3;
+    if (self.forceMode == 0) [btn setTitle:@"Ép Kiểu: Gốc (Auto)" forState:UIControlStateNormal];
+    else if (self.forceMode == 1) [btn setTitle:@"Ép Kiểu: Giá trị = 1" forState:UIControlStateNormal];
+    else [btn setTitle:@"Ép Kiểu: TrackAll = 2" forState:UIControlStateNormal];
 }
 
 #pragma mark - Quét & Mod Tiền Career Mode
@@ -291,7 +316,7 @@ struct TrackMemItem {
     [self.floatingBtn addGestureRecognizer:panIcon];
     [self addSubview:self.floatingBtn];
 
-    self.panelView = [[UIView alloc] initWithFrame:CGRectMake(80, 25, 330, 305)];
+    self.panelView = [[UIView alloc] initWithFrame:CGRectMake(80, 20, 330, 315)];
     self.panelView.backgroundColor = [UIColor colorWithRed:0.05 green:0.07 blue:0.12 alpha:0.95];
     self.panelView.layer.cornerRadius = 14;
     self.panelView.layer.borderWidth = 1.5;
@@ -299,9 +324,9 @@ struct TrackMemItem {
     self.panelView.hidden = YES;
     [self addSubview:self.panelView];
 
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 330, 32)];
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 330, 30)];
     title.backgroundColor = [UIColor colorWithRed:0.0 green:0.45 blue:0.70 alpha:0.35];
-    title.text = @"  VP4 - MỞ KHÓA TIA 3D GỐC (TrackAll)";
+    title.text = @"  VP4 - MỞ KHÓA TIA 3D GỐC (TrackAll v3)";
     title.textColor = [UIColor cyanColor];
     title.font = [UIFont boldSystemFontOfSize:12];
     title.userInteractionEnabled = YES;
@@ -309,33 +334,38 @@ struct TrackMemItem {
     [self.panelView addGestureRecognizer:panMenu];
     [self.panelView addSubview:title];
 
-    [self addBtn:@"B1: Quét Có Tia" frame:CGRectMake(10, 40, 100, 32) tag:1 action:@selector(onTrackBtn:)];
-    [self addBtn:@"B2: Lọc Mất Tia" frame:CGRectMake(115, 40, 100, 32) tag:2 action:@selector(onTrackBtn:)];
-    [self addBtn:@"B2B: Lọc Có Lại" frame:CGRectMake(220, 40, 100, 32) tag:3 action:@selector(onTrackBtn:)];
+    [self addBtn:@"B1: Quét Có Tia" frame:CGRectMake(10, 36, 100, 30) tag:1 action:@selector(onTrackBtn:)];
+    [self addBtn:@"B2: Lọc Mất Tia" frame:CGRectMake(115, 36, 100, 30) tag:2 action:@selector(onTrackBtn:)];
+    [self addBtn:@"B2B: Lọc Có Lại" frame:CGRectMake(220, 36, 100, 30) tag:3 action:@selector(onTrackBtn:)];
 
     [self addBtn:@"BƯỚC 3: KHÓA BẬT TIA 3D (OFF)"
-           frame:CGRectMake(10, 78, 310, 34)
+           frame:CGRectMake(10, 72, 205, 32)
              tag:4
           action:@selector(step3ToggleLock:)];
 
-    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 116, 310, 52)];
-    self.statusLabel.text = @"⚠️ BẮT BUỘC LÀM ĐỦ BƯỚC:\n1) Vào Practice (có đủ tia đỏ/trắng) bấm [B1]\n2) Sang Career (mất tia) bấm [B2]\n3) Quay lại Practice bấm [B2B] -> rồi mới bấm [BƯỚC 3]!";
+    [self addBtn:@"Ép Kiểu: Gốc (Auto)"
+           frame:CGRectMake(220, 72, 100, 32)
+             tag:5
+          action:@selector(cycleForceMode:)];
+
+    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 108, 310, 56)];
+    self.statusLabel.text = @"💡 MẸO QUÉT CHUẨN TRONG 1 BÀN: Vào Quick Play (đang có tia đỏ) bấm [B1] -> Vào Menu game tắt Tracking bấm [B2] -> Bật lại Tracking bấm [B2B] -> Bấm [BƯỚC 3] rồi vào Career!";
     self.statusLabel.textColor = [UIColor greenColor];
     self.statusLabel.font = [UIFont systemFontOfSize:10];
     self.statusLabel.numberOfLines = 4;
     [self.panelView addSubview:self.statusLabel];
 
-    UIView *line = [[UIView alloc] initWithFrame:CGRectMake(10, 172, 310, 1)];
+    UIView *line = [[UIView alloc] initWithFrame:CGRectMake(10, 168, 310, 1)];
     line.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.2];
     [self.panelView addSubview:line];
 
-    UILabel *mTitle = [[UILabel alloc] initWithFrame:CGRectMake(10, 178, 310, 18)];
+    UILabel *mTitle = [[UILabel alloc] initWithFrame:CGRectMake(10, 174, 310, 18)];
     mTitle.text = @"💰 MOD TIỀN CAREER MODE (NHẬP TIỀN HIỆN TẠI):";
     mTitle.textColor = [UIColor yellowColor];
     mTitle.font = [UIFont boldSystemFontOfSize:11];
     [self.panelView addSubview:mTitle];
 
-    self.moneyInput = [[UITextField alloc] initWithFrame:CGRectMake(10, 200, 120, 30)];
+    self.moneyInput = [[UITextField alloc] initWithFrame:CGRectMake(10, 196, 120, 30)];
     self.moneyInput.backgroundColor = [UIColor colorWithWhite:0.15 alpha:1.0];
     self.moneyInput.textColor = [UIColor whiteColor];
     self.moneyInput.placeholder = @"VD: 1500";
@@ -345,11 +375,11 @@ struct TrackMemItem {
     self.moneyInput.delegate = self;
     [self.panelView addSubview:self.moneyInput];
 
-    [self addBtn:@"Quét Tiền" frame:CGRectMake(138, 200, 86, 30) tag:10 action:@selector(onMoneyBtn:)];
-    [self addBtn:@"Lọc Tiền" frame:CGRectMake(232, 200, 88, 30) tag:11 action:@selector(onMoneyBtn:)];
-    [self addBtn:@"Sửa Tiền Thành 9,999,999$" frame:CGRectMake(10, 236, 310, 32) tag:12 action:@selector(onMoneyBtn:)];
+    [self addBtn:@"Quét Tiền" frame:CGRectMake(138, 196, 86, 30) tag:10 action:@selector(onMoneyBtn:)];
+    [self addBtn:@"Lọc Tiền" frame:CGRectMake(232, 196, 88, 30) tag:11 action:@selector(onMoneyBtn:)];
+    [self addBtn:@"Sửa Tiền Thành 9,999,999$" frame:CGRectMake(10, 232, 310, 32) tag:12 action:@selector(onMoneyBtn:)];
 
-    self.moneyStatusLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 272, 310, 22)];
+    self.moneyStatusLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 268, 310, 22)];
     self.moneyStatusLabel.text = @"Sẵn sàng quét bộ nhớ.";
     self.moneyStatusLabel.textColor = [UIColor lightGrayColor];
     self.moneyStatusLabel.font = [UIFont systemFontOfSize:10];
