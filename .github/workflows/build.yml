@@ -12,39 +12,102 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Locate cwTrackSettings & TrackAll Offsets
+      - name: Disassemble XREFs to TrackAll & cwTrackSettings
         run: |
           if [ -f "VirtualPool4iPhone" ]; then
             chmod +x VirtualPool4iPhone
             python3 - << 'EOF' > Offsets_Report.txt
-          import subprocess, re
+          import struct, subprocess
 
           with open("VirtualPool4iPhone", "rb") as f:
               data = f.read()
 
-          targets = [
-              b"15cwTrackSettings",
-              b"No AimAids\x00",
-              b"AimLine\x00",
-              b"TrackAll\x00",
-              b"Track Type\x00",
-              b"Track AimLine\x00",
-              b"Track CueBall\x00",
-              b"Restrict Aim Eyepoint\x00",
-              b"CareerCash1500\x00"
-          ]
+          BASE = 0x100000000
+          TEXT_START = 0x00004000
+          TEXT_END   = 0x00004000 + 0x00bb1058
 
-          print("=== EXACT FILE OFFSETS OF TRACK STRINGS ===")
-          for t in targets:
+          target_vmas = {
+              0x100cfc720: "15cwTrackSettings (RTTI name)",
+              0x100d3e4b7: "No AimAids",
+              0x100d3e4c2: "AimLine (1)",
+              0x100d3ec4f: "AimLine (2)",
+              0x100d3e4d4: "TrackAll",
+              0x100d3ec3e: "Track Type",
+              0x100d3ec49: "Track AimLine",
+              0x100d3ec57: "Track CueBall",
+              0x100d3ed77: "Restrict Aim Eyepoint",
+              0x100d37569: "CareerCash1500"
+          }
+
+          target_pages = {vma & ~0xfff for vma in target_vmas}
+          xrefs = []
+
+          print("=== 1. ARM64 CODE XREFS (ADRP + ADD/LDR) TO TRACK STRINGS ===")
+          for off in range(TEXT_START, TEXT_END - 4, 4):
+              insn1 = struct.unpack_from("<I", data, off)[0]
+              if (insn1 & 0x9f000000) == 0x90000000: # ADRP
+                  rd = insn1 & 0x1f
+                  immlo = (insn1 >> 29) & 0x3
+                  immhi = (insn1 >> 5) & 0x7ffff
+                  imm = (immhi << 2) | immlo
+                  if imm & (1 << 20):
+                      imm -= (1 << 21)
+                  pc_page = (BASE + off) & ~0xfff
+                  page = (pc_page + (imm << 12)) & 0xffffffffffffffff
+                  if page in target_pages:
+                      for lookahead in range(1, 8):
+                          if off + lookahead * 4 >= TEXT_END: break
+                          insn2 = struct.unpack_from("<I", data, off + lookahead * 4)[0]
+                          # ADD Xd, Xn, #imm12
+                          if (insn2 & 0xff800000) == 0x91000000:
+                              rn = (insn2 >> 5) & 0x1f
+                              imm12 = (insn2 >> 10) & 0xfff
+                              sh = (insn2 >> 22) & 0x1
+                              if sh: imm12 <<= 12
+                              full_addr = page + imm12
+                              if rn == rd and full_addr in target_vmas:
+                                   vma_pc = BASE + off
+                                  print(f"Code @ 0x{vma_pc:09x} -> refs '{target_vmas[full_addr]}' (0x{full_addr:09x})")
+                                  xrefs.append(vma_pc)
+
+          print("\n=== 2. POINTER REFERENCES IN __DATA_CONST / __DATA (RTTI & VTABLE) ===")
+          for vma in list(target_vmas.keys()):
+              packed = struct.pack("<Q", vma)
               idx = 0
               while True:
-                  pos = data.find(t, idx)
+                  pos = data.find(packed, idx)
                   if pos == -1: break
-                  print(f"{t.decode('latin1').strip(chr(0)):25s} -> File Offset: 0x{pos:08x} (VMAddr ~ 0x{0x100000000 + pos:09x})")
+                  ptr_vma = BASE + pos
+                  print(f"Pointer @ File 0x{pos:08x} (VMAddr 0x{ptr_vma:09x}) -> points to '{target_vmas[vma]}'")
+                  # Nếu là RTTI name, tìm tiếp TypeInfo (ptr_vma - 8)
+                  if vma == 0x100cfc720:
+                      typeinfo_vma = ptr_vma - 8
+                      ti_packed = struct.pack("<Q", typeinfo_vma)
+                      idx2 = 0
+                      while True:
+                          pos2 = data.find(ti_packed, idx2)
+                          if pos2 == -1: break
+                          vtable_start = BASE + pos2 + 8
+                          print(f"  [!] FOUND cwTrackSettings VTABLE @ VMAddr 0x{vtable_start:09x} (File 0x{pos2+8:08x})")
+                          for m in range(12):
+                              fn_ptr = struct.unpack_from("<Q", data, pos2 + 8 + m*8)[0]
+                              print(f"      vtable[{m}] = 0x{fn_ptr:09x}")
+                          idx2 = pos2 + 1
                   idx = pos + 1
+
+          print("\n=== 3. DISASSEMBLY AROUND TRACK XREFS ===")
+          seen = set()
+          for x in xrefs:
+              window = (x & ~0x3f)
+              if window in seen: continue
+              seen.add(window)
+              start_addr = x - 0x60
+              end_addr   = x + 0x120
+              print(f"\n--- Disassembly around 0x{x:09x} (0x{start_addr:09x} .. 0x{end_addr:09x}) ---")
+              cmd = ["xcrun", "llvm-objdump", "-d", f"--start-address=0x{start_addr:x}", f"--stop-address=0x{end_addr:x}", "VirtualPool4iPhone"]
+              out = subprocess.check_output(cmd, text=True, errors="ignore")
+              print(out)
           EOF
-            echo "=== SECTION HEADERS ===" >> Offsets_Report.txt
-            otool -l VirtualPool4iPhone | grep -A 5 -E "sectname (__text|__cstring|__const|__data|__bss)" >> Offsets_Report.txt || true
           fi
 
       - name: Compile PoolModMenu.dylib (arm64)
