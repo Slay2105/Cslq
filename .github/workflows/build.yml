@@ -12,22 +12,40 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Auto-Extract Native Track Offsets from VirtualPool4iPhone Binary
+      - name: Locate cwTrackSettings & TrackAll Offsets
         run: |
-          echo "// Auto-generated Offsets" > GeneratedOffsets.h
           if [ -f "VirtualPool4iPhone" ]; then
             chmod +x VirtualPool4iPhone
-            echo "=== SYMBOL & STRING REPORT ===" > Offsets_Report.txt
-            nm -a -C VirtualPool4iPhone | grep -i -E "track|aim|assist|practice|career|trajectory|ghost|line|pocket|cash|bankroll" >> Offsets_Report.txt || true
-            echo "=== OBJC METADATA ===" >> Offsets_Report.txt
-            llvm-objdump --macho --objc-meta-data VirtualPool4iPhone | grep -i -E "track|aim|practice|career|cash|draw|render" >> Offsets_Report.txt || true
-            echo "=== CSTRINGS ===" >> Offsets_Report.txt
-            strings -n 4 VirtualPool4iPhone | grep -i -E "track|aim|trajectory|practice|career|bankroll|assist" >> Offsets_Report.txt || true
-          else
-            echo "No binary uploaded, using runtime memory scanner." > Offsets_Report.txt
+            python3 - << 'EOF' > Offsets_Report.txt
+          import subprocess, re
+
+          with open("VirtualPool4iPhone", "rb") as f:
+              data = f.read()
+
+          targets = [
+              b"15cwTrackSettings",
+              b"No AimAids\x00",
+              b"AimLine\x00",
+              b"TrackAll\x00",
+              b"Track Type\x00",
+              b"Track AimLine\x00",
+              b"Track CueBall\x00",
+              b"Restrict Aim Eyepoint\x00",
+              b"CareerCash1500\x00"
+          ]
+
+          print("=== EXACT FILE OFFSETS OF TRACK STRINGS ===")
+          for t in targets:
+              idx = 0
+              while True:
+                  pos = data.find(t, idx)
+                  if pos == -1: break
+                  print(f"{t.decode('latin1').strip(chr(0)):25s} -> File Offset: 0x{pos:08x} (VMAddr ~ 0x{0x100000000 + pos:09x})")
+                  idx = pos + 1
+          EOF
+            echo "=== SECTION HEADERS ===" >> Offsets_Report.txt
+            otool -l VirtualPool4iPhone | grep -A 5 -E "sectname (__text|__cstring|__const|__data|__bss)" >> Offsets_Report.txt || true
           fi
-          echo "static const uint64_t kAutoTrackOffsets[] = {};" >> GeneratedOffsets.h
-          echo "static const size_t kAutoTrackOffsetsCount = 0;" >> GeneratedOffsets.h
 
       - name: Compile PoolModMenu.dylib (arm64)
         run: |
