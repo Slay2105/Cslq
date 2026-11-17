@@ -12,11 +12,11 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Dump SetAimAids (0x1001112b8) & GetAimFlag (0x10017bdc8)
+      - name: Dump Dynamic Path & Stroke Functions
         run: |
           if [ -f "VirtualPool4iPhone" ]; then
-            xcrun llvm-objdump -d --start-address=0x1001112b8 --stop-address=0x100111450 VirtualPool4iPhone > Offsets_Report.txt || true
-            xcrun llvm-objdump -d --start-address=0x10017bdc8 --stop-address=0x10017bf00 VirtualPool4iPhone >> Offsets_Report.txt || true
+            xcrun llvm-objdump -d --start-address=0x1001968c8 --stop-address=0x100196980 VirtualPool4iPhone > Offsets_Report.txt || true
+            xcrun llvm-objdump -d --start-address=0x10017bdb0 --stop-address=0x10017be20 VirtualPool4iPhone >> Offsets_Report.txt || true
           else
             echo "Build Dylib Only" > Offsets_Report.txt
           fi
