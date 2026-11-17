@@ -10,7 +10,7 @@
 #import <algorithm>
 #import <cmath>
 
-// Hàm tính địa chỉ thực tế trong RAM từ địa chỉ tĩnh trong Offsets_Report_4.txt
+// Hàm tính vi trí thực tế trong RAM từ địa chỉ tĩnh trong Offsets_Report_4.txt
 static inline vm_address_t VP4Addr(uintptr_t baseHeader, uint64_t staticVMA) {
     return (vm_address_t)(baseHeader + (staticVMA - 0x100000000ULL));
 }
